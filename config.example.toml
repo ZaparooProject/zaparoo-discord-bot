@@ -1,0 +1,12 @@
+# Project configuration: emoji = ["owner/repo", "Display Name"]
+# First project is the default when no project emoji is selected
+[projects]
+"🖥️" = ["ZaparooProject/zaparoo-core", "Core"]
+"📱" = ["ZaparooProject/zaparoo-app", "App"]
+"🎨" = ["ZaparooProject/zaparoo-designer", "Designer"]
+
+# Issue type configuration: emoji = "label" (use "" for no label)
+[issue_types]
+"🐛" = "bug"
+"💡" = "enhancement"
+"📋" = ""

@@ -1,0 +1,32 @@
+[Unit]
+Description=Discord Issue Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=discord-bot
+Group=discord-bot
+
+WorkingDirectory=/opt/discord-issue-bot
+# Adjust path to uv if needed (e.g., /home/user/.local/bin/uv)
+ExecStart=/usr/bin/uv run bot.py
+Restart=always
+RestartSec=10
+
+# Environment
+EnvironmentFile=/opt/discord-issue-bot/.env
+
+# Security hardening
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/opt/discord-issue-bot/images
+
+# Resource limits
+MemoryMax=256M
+CPUQuota=50%
+
+[Install]
+WantedBy=multi-user.target
