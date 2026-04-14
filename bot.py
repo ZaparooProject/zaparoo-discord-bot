@@ -40,59 +40,64 @@ logging.basicConfig(
 
 load_dotenv()
 
-# Required config
+# Secrets from .env
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
-AUTHORIZED_ROLE_ID = int(os.getenv("AUTHORIZED_ROLE_ID", "0"))
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-
-# GitHub auth - either use App (preferred) or personal token
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
-GITHUB_APP_ID = os.getenv("GITHUB_APP_ID")
-GITHUB_APP_PRIVATE_KEY_PATH = os.getenv("GITHUB_APP_PRIVATE_KEY_PATH")
-GITHUB_APP_INSTALLATION_ID = os.getenv("GITHUB_APP_INSTALLATION_ID")
 
-# File hosting (files saved locally, served by external web server like nginx)
-IMAGES_DIR = Path(os.getenv("IMAGES_DIR", "./images"))
-IMAGES_URL = os.getenv("IMAGES_URL", "https://example.com/discord-images")
-
-# How many previous messages to include as context
-CONTEXT_MESSAGES = int(os.getenv("CONTEXT_MESSAGES", "5"))
-
-# How long to wait for second reaction (seconds)
-PENDING_TIMEOUT = int(os.getenv("PENDING_TIMEOUT", "60"))
-
-# Max attachment size in bytes (default 10MB)
-MAX_ATTACHMENT_SIZE = int(os.getenv("MAX_ATTACHMENT_SIZE", str(10 * 1024 * 1024)))
-
-# OpenAI model for title generation
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o")
-
-# Configuration file path
+# Configuration file path (only non-secret setting in .env)
 CONFIG_PATH = Path(os.getenv("CONFIG_PATH", "./config.toml"))
 
 
-def load_config(path: Path) -> tuple[dict[str, tuple[str, str]], dict[str, str | None]]:
-    """Load project and issue type configuration from a TOML file."""
+def load_config(path: Path) -> dict:
+    """Load configuration from a TOML file."""
     with open(path, "rb") as f:
-        config = tomllib.load(f)
-
-    projects = {emoji: tuple(val) for emoji, val in config.get("projects", {}).items()}
-    issue_types = {
-        emoji: (label if label else None) for emoji, label in config.get("issue_types", {}).items()
-    }
-    return projects, issue_types
+        return tomllib.load(f)
 
 
-# Load config from file, fall back to defaults
+# Load config from file
 if CONFIG_PATH.exists():
-    PROJECTS, ISSUE_TYPES = load_config(CONFIG_PATH)
+    _config = load_config(CONFIG_PATH)
     logging.info(f"Loaded configuration from {CONFIG_PATH}")
 else:
+    _config = {}
+
+# Discord
+AUTHORIZED_ROLE_ID = int(_config.get("discord", {}).get("authorized_role_id", 0))
+
+# GitHub App auth (alternative to GITHUB_TOKEN in .env)
+_github_cfg = _config.get("github", {})
+GITHUB_APP_ID = _github_cfg.get("app_id")
+GITHUB_APP_PRIVATE_KEY_PATH = _github_cfg.get("app_private_key_path")
+GITHUB_APP_INSTALLATION_ID = _github_cfg.get("app_installation_id")
+
+# OpenAI
+OPENAI_MODEL = _config.get("openai", {}).get("model", "gpt-4o")
+
+# File hosting
+_files_cfg = _config.get("files", {})
+IMAGES_DIR = Path(_files_cfg.get("images_dir", "./images"))
+IMAGES_URL = _files_cfg.get("images_url", "https://example.com/discord-images")
+MAX_ATTACHMENT_SIZE = int(_files_cfg.get("max_attachment_size", 10 * 1024 * 1024))
+
+# Bot behavior
+_bot_cfg = _config.get("bot", {})
+CONTEXT_MESSAGES = int(_bot_cfg.get("context_messages", 5))
+PENDING_TIMEOUT = int(_bot_cfg.get("pending_timeout", 60))
+
+# Projects and issue types
+PROJECTS = {emoji: tuple(val) for emoji, val in _config.get("projects", {}).items()}
+ISSUE_TYPES = {
+    emoji: (label if label else None) for emoji, label in _config.get("issue_types", {}).items()
+}
+
+if not PROJECTS:
     PROJECTS = {
         "🖥️": ("ZaparooProject/zaparoo-core", "Core"),
         "📱": ("ZaparooProject/zaparoo-app", "App"),
         "🎨": ("ZaparooProject/zaparoo-designer", "Designer"),
     }
+if not ISSUE_TYPES:
     ISSUE_TYPES = {"🐛": "bug", "💡": "enhancement", "📋": None}
 
 # Default project (first in PROJECTS)
@@ -520,7 +525,7 @@ if __name__ == "__main__":
         print("Error: DISCORD_TOKEN not set")
         exit(1)
     if not AUTHORIZED_ROLE_ID:
-        print("Error: AUTHORIZED_ROLE_ID not set")
+        print("Error: discord.authorized_role_id not set in config.toml")
         exit(1)
     if not OPENAI_API_KEY:
         print("Error: OPENAI_API_KEY not set")
@@ -533,8 +538,8 @@ if __name__ == "__main__":
 
     if not github_client:
         print(
-            "Error: Set GITHUB_TOKEN or GITHUB_APP_ID"
-            " + GITHUB_APP_PRIVATE_KEY_PATH + GITHUB_APP_INSTALLATION_ID"
+            "Error: Set GITHUB_TOKEN in .env or configure"
+            " [github] app settings in config.toml"
         )
         exit(1)
 

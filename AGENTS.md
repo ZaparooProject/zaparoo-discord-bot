@@ -20,14 +20,14 @@ No build step. Ruff handles both linting and formatting.
 Single-file bot: all logic lives in `bot.py` (~540 lines). No packages, no modules.
 
 Key sections in `bot.py`:
-- **Lines 1-100**: Config loading (env vars, TOML config, constants)
+- **Lines 1-100**: Config loading (secrets from .env, everything else from config.toml)
 - **`init()`**: Creates OpenAI/GitHub clients. Called only from `__main__`, not at import time. This is intentional -- importing `bot` must be side-effect-free for tests.
 - **`process_reaction()`**: Core logic. Handles the full reaction -> issue creation flow.
 - **`create_github_issue()`**: Synchronous (PyGithub). Always called via `asyncio.to_thread()`.
 
 Config files:
-- `.env` -- Secrets and env-specific settings (gitignored)
-- `config.toml` -- Project/issue type emoji mapping (gitignored, loaded by `load_config()`)
+- `.env` -- Secrets only: `DISCORD_TOKEN`, `OPENAI_API_KEY`, `GITHUB_TOKEN` (gitignored)
+- `config.toml` -- All non-secret config: discord, github app, openai, files, bot behavior, projects, issue types (gitignored, loaded by `load_config()`)
 - `config.example.toml` / `.env.example` -- Templates shipped with the repo
 
 ## Testing
