@@ -1,5 +1,4 @@
 .env
-config.toml
 images/
 .ruff_cache/
 __pycache__/

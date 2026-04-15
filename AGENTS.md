@@ -20,7 +20,7 @@ No build step. Ruff handles both linting and formatting.
 Single-file bot: all logic lives in `bot.py` (~640 lines). No packages, no modules.
 
 Key sections in `bot.py`:
-- **Lines 1-110**: Config loading (secrets from .env, everything else from config.toml)
+- **Lines 1-110**: Config (secrets from .env, everything else hardcoded)
 - **`make_support_callback()`**: Factory that creates context menu callbacks for support responses. Each callback builds an embed + URL buttons from config and replies to the target message.
 - **`CreateIssueModal`**: Modal with project and issue type Select dropdowns. Shown when user picks "Create Issue" from the right-click Apps menu. On submit, calls `create_issue_from_message()`.
 - **`IssueBot.setup_hook()`**: Creates HTTP session and registers context menu commands: support responses from `SUPPORT_RESPONSES` config + the "Create Issue" command. Tree sync happens in `on_ready`.
@@ -29,14 +29,14 @@ Key sections in `bot.py`:
 - **`process_reaction()`**: Handles the reaction -> issue creation flow. Delegates to `create_issue_from_message()`.
 - **`create_github_issue()`**: Synchronous (PyGithub). Always called via `asyncio.to_thread()`.
 
-Config files:
-- `.env` -- Secrets only: `DISCORD_TOKEN`, `OPENAI_API_KEY`, `GITHUB_TOKEN` (gitignored)
-- `config.toml` -- All non-secret config: discord, github app, openai, files, bot behavior, projects, issue types, support responses (gitignored, loaded by `load_config()`)
-- `config.example.toml` / `.env.example` -- Templates shipped with the repo
+Config:
+- `.env` -- Secrets and deployment-specific: `DISCORD_TOKEN`, `OPENAI_API_KEY`, `GITHUB_TOKEN`, `AUTHORIZED_ROLE_ID`, `GITHUB_APP_*`, `IMAGES_URL` (gitignored)
+- `.env.example` -- Template shipped with the repo
+- Everything else (projects, issue types, support responses, model, timeouts) is hardcoded in `bot.py`
 
-Support responses are configured as `[[support_responses]]` entries in config.toml. Each entry becomes a right-click (Apps) context menu command. Max 4 entries (1 of 5 Discord context menu slots is reserved for "Create Issue"). Each has a `name`, `title`, `message`, and optional `buttons` array with `label`/`url` pairs.
+Support responses are hardcoded in `SUPPORT_RESPONSES` in `bot.py`. Each entry becomes a right-click (Apps) context menu command. Max 4 entries (1 of 5 Discord context menu slots is reserved for "Create Issue"). Each has a `name`, `title`, `message`, and optional `buttons` list with `label`/`url` pairs.
 
-The "Create Issue" context menu command is always registered. It opens a Modal with two Select dropdowns (project and issue type) populated from the `[projects]` and `[issue_types]` config sections.
+The "Create Issue" context menu command is always registered. It opens a Modal with two Select dropdowns (project and issue type) populated from the `PROJECTS` and `ISSUE_TYPES` dicts.
 
 ## Testing
 
@@ -59,6 +59,6 @@ When writing tests, import from `bot` inside the test function (not at module le
 
 ## Boundaries
 
-- **Never commit**: `.env`, `config.toml`, `images/`, private keys
+- **Never commit**: `.env`, `images/`, private keys
 - **Never add to file whitelist**: executable or web-servable extensions (.php, .js, .html, .svg, .py, .sh, .exe, .bat)
 - **Always run tests and linter** before considering work complete

@@ -37,29 +37,9 @@ Bot creates: Bug issue on App
 
 ## Configuration
 
-### Projects and Issue Types
+Projects, issue types, and support responses are hardcoded in `bot.py`. Edit them directly to customize for your Discord server.
 
-Copy the example config and edit it:
-
-```bash
-cp config.example.toml config.toml
-```
-
-```toml
-# Project configuration: emoji = ["owner/repo", "Display Name"]
-# First project is the default when no project emoji is selected
-[projects]
-"🖥️" = ["your-org/your-repo", "Core"]
-"📱" = ["your-org/your-app", "App"]
-
-# Issue type configuration: emoji = "label" (use "" for no label)
-[issue_types]
-"🐛" = "bug"
-"💡" = "enhancement"
-"📋" = ""
-```
-
-If no `config.toml` is found, built-in defaults are used.
+Secrets and deployment-specific settings go in `.env` (see below).
 
 ## Quick Start
 
@@ -94,9 +74,7 @@ If no `config.toml` is found, built-in defaults are used.
 
 ```bash
 cp .env.example .env
-cp config.example.toml config.toml
 # Edit .env with your tokens and settings
-# Edit config.toml with your projects and issue types
 
 uv run bot.py
 ```
@@ -106,19 +84,13 @@ uv run bot.py
 | Variable | Required | Description |
 |----------|----------|-------------|
 | `DISCORD_TOKEN` | Yes | Discord bot token |
-| `AUTHORIZED_ROLE_ID` | Yes | Discord role ID for authorized users |
 | `OPENAI_API_KEY` | Yes | OpenAI API key for generating issue titles |
+| `AUTHORIZED_ROLE_ID` | Yes | Discord role ID for authorized users |
 | `GITHUB_TOKEN` | Yes* | GitHub personal access token |
 | `GITHUB_APP_ID` | Yes* | GitHub App ID (alternative to token) |
 | `GITHUB_APP_PRIVATE_KEY_PATH` | Yes* | Path to GitHub App private key PEM file |
 | `GITHUB_APP_INSTALLATION_ID` | Yes* | GitHub App installation ID |
-| `IMAGES_DIR` | No | Local directory for files (default: `./images`) |
 | `IMAGES_URL` | No | Public URL for files served by nginx |
-| `CONTEXT_MESSAGES` | No | Previous messages to include (default: `5`) |
-| `PENDING_TIMEOUT` | No | Seconds to wait for second reaction (default: `60`) |
-| `MAX_ATTACHMENT_SIZE` | No | Max attachment size in bytes (default: `10485760`) |
-| `OPENAI_MODEL` | No | OpenAI model for titles (default: `gpt-4o`) |
-| `CONFIG_PATH` | No | Path to config file (default: `./config.toml`) |
 
 *GitHub auth: set either `GITHUB_TOKEN` **or** all three `GITHUB_APP_*` variables.
 

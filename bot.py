@@ -21,7 +21,6 @@ import hashlib
 import logging
 import os
 import time
-import tomllib
 from datetime import datetime
 from pathlib import Path
 from typing import TypedDict
@@ -41,68 +40,38 @@ logging.basicConfig(
 
 load_dotenv()
 
-# Secrets from .env
+# Secrets and deployment-specific settings from .env
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
+AUTHORIZED_ROLE_ID = int(os.getenv("AUTHORIZED_ROLE_ID", "0"))
+_app_id = os.getenv("GITHUB_APP_ID")
+GITHUB_APP_ID = int(_app_id) if _app_id else None
+GITHUB_APP_PRIVATE_KEY_PATH = os.getenv("GITHUB_APP_PRIVATE_KEY_PATH")
+_app_install = os.getenv("GITHUB_APP_INSTALLATION_ID")
+GITHUB_APP_INSTALLATION_ID = int(_app_install) if _app_install else None
+IMAGES_URL = os.getenv("IMAGES_URL", "")
 
-# Configuration file path (only non-secret setting in .env)
-CONFIG_PATH = Path(os.getenv("CONFIG_PATH", "./config.toml"))
+# Hardcoded config
+OPENAI_MODEL = "gpt-4o"
+IMAGES_DIR = Path("./images")
+MAX_ATTACHMENT_SIZE = 10_485_760
+CONTEXT_MESSAGES = 5
+PENDING_TIMEOUT = 60
 
+PROJECTS = {
+    "🖥️": ("ZaparooProject/zaparoo-core", "Core"),
+    "📱": ("ZaparooProject/zaparoo-app", "App"),
+    "🎨": ("ZaparooProject/zaparoo-designer", "Designer"),
+}
+DEFAULT_PROJECT = list(PROJECTS.values())[0]
 
-def load_config(path: Path) -> dict:
-    """Load configuration from a TOML file."""
-    with open(path, "rb") as f:
-        return tomllib.load(f)
-
-
-# Load config from file
-if CONFIG_PATH.exists():
-    _config = load_config(CONFIG_PATH)
-    logging.info(f"Loaded configuration from {CONFIG_PATH}")
-else:
-    _config = {}
-
-# Discord
-AUTHORIZED_ROLE_ID = int(_config.get("discord", {}).get("authorized_role_id", 0))
-
-# GitHub App auth (alternative to GITHUB_TOKEN in .env)
-_github_cfg = _config.get("github", {})
-GITHUB_APP_ID = _github_cfg.get("app_id")
-GITHUB_APP_PRIVATE_KEY_PATH = _github_cfg.get("app_private_key_path")
-GITHUB_APP_INSTALLATION_ID = _github_cfg.get("app_installation_id")
-
-# OpenAI
-OPENAI_MODEL = _config.get("openai", {}).get("model", "gpt-4o")
-
-# File hosting
-_files_cfg = _config.get("files", {})
-IMAGES_DIR = Path(_files_cfg.get("images_dir", "./images"))
-IMAGES_URL = _files_cfg.get("images_url", "https://example.com/discord-images")
-MAX_ATTACHMENT_SIZE = int(_files_cfg.get("max_attachment_size", 10 * 1024 * 1024))
-
-# Bot behavior
-_bot_cfg = _config.get("bot", {})
-CONTEXT_MESSAGES = int(_bot_cfg.get("context_messages", 5))
-PENDING_TIMEOUT = int(_bot_cfg.get("pending_timeout", 60))
-
-# Projects and issue types
-PROJECTS = {emoji: tuple(val) for emoji, val in _config.get("projects", {}).items()}
 ISSUE_TYPES = {
-    emoji: (label if label else None) for emoji, label in _config.get("issue_types", {}).items()
+    "🐛": "bug",
+    "💡": "enhancement",
+    "📋": None,
 }
 
-if not PROJECTS:
-    PROJECTS = {
-        "🖥️": ("ZaparooProject/zaparoo-core", "Core"),
-        "📱": ("ZaparooProject/zaparoo-app", "App"),
-        "🎨": ("ZaparooProject/zaparoo-designer", "Designer"),
-    }
-if not ISSUE_TYPES:
-    ISSUE_TYPES = {"🐛": "bug", "💡": "enhancement", "📋": None}
-
-# Default project (first in PROJECTS)
-DEFAULT_PROJECT = list(PROJECTS.values())[0]
 
 class SupportButton(TypedDict, total=False):
     label: str
@@ -116,8 +85,42 @@ class SupportResponse(TypedDict, total=False):
     buttons: list[SupportButton]
 
 
-# Support responses (context menu commands with embed + URL buttons)
-SUPPORT_RESPONSES: list[SupportResponse] = _config.get("support_responses", [])
+SUPPORT_RESPONSES: list[SupportResponse] = [
+    {
+        "name": "Request Logs",
+        "title": "📋 Log File Needed",
+        "message": (
+            "To help troubleshoot, please send us your log file:\n"
+            "\n"
+            "1. Open the **Zaparoo App** or **TUI**\n"
+            "2. Go to **Settings > Advanced > View logs**\n"
+            "3. Tap **Upload** to get a shareable link\n"
+            "4. Paste the link here"
+        ),
+        "buttons": [
+            {"label": "📄 Log Guide", "url": "https://zaparoo.org/support/#collecting-logs"},
+            {"label": "Full Support Page", "url": "https://zaparoo.org/support/"},
+        ],
+    },
+    {
+        "name": "Enable Debug Mode",
+        "title": "🔍 Debug Logging Needed",
+        "message": (
+            "Please enable debug logging and reproduce the issue:\n"
+            "\n"
+            "1. Open the **Zaparoo App** or **TUI**\n"
+            "2. Go to **Settings > Advanced**\n"
+            "3. Enable **Debug Logging**\n"
+            "4. Reproduce the issue\n"
+            "5. Upload the log file (**Settings > Advanced > View logs > Upload**)\n"
+            "6. Paste the shareable link here"
+        ),
+        "buttons": [
+            {"label": "🔍 Debug Guide", "url": "https://zaparoo.org/support/#debug-logging"},
+            {"label": "📄 Log Guide", "url": "https://zaparoo.org/support/#collecting-logs"},
+        ],
+    },
+]
 
 # Allowed file extensions (security whitelist)
 ALLOWED_FILE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".txt", ".log"}
@@ -693,25 +696,16 @@ if __name__ == "__main__":
         print("Error: DISCORD_TOKEN not set")
         exit(1)
     if not AUTHORIZED_ROLE_ID:
-        print("Error: discord.authorized_role_id not set in config.toml")
+        print("Error: AUTHORIZED_ROLE_ID not set in .env")
         exit(1)
     if not OPENAI_API_KEY:
         print("Error: OPENAI_API_KEY not set")
-        exit(1)
-    if not PROJECTS:
-        print("Error: No projects configured")
-        exit(1)
-    if len(SUPPORT_RESPONSES) > 4:
-        print("Error: Max 4 support responses allowed (1 slot reserved for Create Issue)")
         exit(1)
 
     init()
 
     if not github_client:
-        print(
-            "Error: Set GITHUB_TOKEN in .env or configure"
-            " [github] app settings in config.toml"
-        )
+        print("Error: Set GITHUB_TOKEN or GITHUB_APP_* variables in .env")
         exit(1)
 
     asyncio.run(main())
