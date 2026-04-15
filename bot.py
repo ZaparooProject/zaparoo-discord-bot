@@ -24,6 +24,7 @@ import time
 import tomllib
 from datetime import datetime
 from pathlib import Path
+from typing import TypedDict
 
 import aiohttp
 import discord
@@ -103,6 +104,21 @@ if not ISSUE_TYPES:
 # Default project (first in PROJECTS)
 DEFAULT_PROJECT = list(PROJECTS.values())[0]
 
+class SupportButton(TypedDict, total=False):
+    label: str
+    url: str
+
+
+class SupportResponse(TypedDict, total=False):
+    name: str
+    title: str
+    message: str
+    buttons: list[SupportButton]
+
+
+# Support responses (context menu commands with embed + URL buttons)
+SUPPORT_RESPONSES: list[SupportResponse] = _config.get("support_responses", [])
+
 # Allowed file extensions (security whitelist)
 ALLOWED_FILE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".txt", ".log"}
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
@@ -118,13 +134,58 @@ intents.messages = True
 intents.members = True
 
 
+def make_support_callback(response_config: dict):
+    """Create a context menu callback for a support response."""
+    title = response_config.get("title", "Support")
+    message_text = response_config.get("message", "")
+    buttons_config = response_config.get("buttons", [])
+
+    async def callback(interaction: discord.Interaction, message: discord.Message):
+        if not isinstance(interaction.user, discord.Member) or not has_authorized_role(
+            interaction.user
+        ):
+            await interaction.response.send_message(
+                "You don't have permission to use this.", ephemeral=True
+            )
+            return
+
+        embed = discord.Embed(title=title, description=message_text, color=0x2B2D31)
+
+        view = discord.ui.View()
+        for btn in buttons_config:
+            url = btn.get("url", "")
+            if not url:
+                continue
+            view.add_item(
+                discord.ui.Button(
+                    style=discord.ButtonStyle.link,
+                    label=btn.get("label", "Link"),
+                    url=url,
+                )
+            )
+
+        await interaction.response.send_message("Sent!", ephemeral=True)
+        try:
+            await message.reply(embed=embed, view=view, mention_author=False)
+        except Exception:
+            logging.exception("Failed to send support response")
+
+    return callback
+
+
 class IssueBot(commands.Bot):
     def __init__(self):
         super().__init__(command_prefix="!", intents=intents, help_command=None)
         self.http_session: aiohttp.ClientSession | None = None
+        self._tree_synced: bool = False
 
     async def setup_hook(self):
         self.http_session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30))
+        for response_config in SUPPORT_RESPONSES:
+            name = response_config.get("name", "Support")
+            callback = make_support_callback(response_config)
+            cmd = discord.app_commands.ContextMenu(name=name, callback=callback)
+            self.tree.add_command(cmd)
 
     async def close(self):
         if self.http_session:
@@ -467,12 +528,19 @@ async def process_reaction(payload: discord.RawReactionActionEvent):
 
 @bot.event
 async def on_ready():
+    if SUPPORT_RESPONSES and not bot._tree_synced:
+        await bot.tree.sync()
+        bot._tree_synced = True
+        logging.info(f"Synced {len(SUPPORT_RESPONSES)} support response command(s)")
     logging.info(f"Logged in as {bot.user} (ID: {bot.user.id})")
     logging.info(f"Authorized role ID: {AUTHORIZED_ROLE_ID}")
     logging.info(f"Images: {IMAGES_DIR.absolute()} -> {IMAGES_URL}")
     for emoji, (repo, name) in PROJECTS.items():
         default = " (default)" if (repo, name) == DEFAULT_PROJECT else ""
         logging.info(f"  {emoji} → {name} ({repo}){default}")
+    if SUPPORT_RESPONSES:
+        for sr in SUPPORT_RESPONSES:
+            logging.info(f"  → {sr.get('name', 'unnamed')}")
 
 
 @bot.event
@@ -532,6 +600,9 @@ if __name__ == "__main__":
         exit(1)
     if not PROJECTS:
         print("Error: No projects configured")
+        exit(1)
+    if len(SUPPORT_RESPONSES) > 5:
+        print("Error: Max 5 support responses allowed (Discord limit)")
         exit(1)
 
     init()

@@ -45,3 +45,25 @@ images_url = "https://your-server.com/discord-files"
 "🐛" = "bug"
 "💡" = "enhancement"
 "📋" = ""
+
+# Support responses - right-click context menu commands that reply with an
+# embed and URL buttons. Each [[support_responses]] entry becomes a separate
+# command in the Apps menu. Max 5 entries (Discord limit).
+#
+# [[support_responses]]
+# name = "Request Logs"
+# title = "📋 Log File Needed"
+# message = """Please send us your log file:
+#
+# 1. Open the **Zaparoo App** or **TUI**
+# 2. Go to **Settings > Advanced > View logs**
+# 3. Tap **Upload** to get a shareable link
+# 4. Paste the link here"""
+#
+# [[support_responses.buttons]]
+# label = "📄 Log Guide"
+# url = "https://zaparoo.org/support/#collecting-logs"
+#
+# [[support_responses.buttons]]
+# label = "Full Support Page"
+# url = "https://zaparoo.org/support/"

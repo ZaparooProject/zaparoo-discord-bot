@@ -448,6 +448,111 @@ class TestChannelFetching:
                 await process_reaction(payload)
 
 
+class TestSupportResponses:
+    """Tests for support response context menu commands."""
+
+    def test_make_support_callback_returns_callable(self):
+        """make_support_callback should return an async callable."""
+        import asyncio
+
+        from bot import make_support_callback
+
+        config = {
+            "title": "Test Title",
+            "message": "Test message",
+            "buttons": [{"label": "Link", "url": "https://example.com"}],
+        }
+        callback = make_support_callback(config)
+        assert asyncio.iscoroutinefunction(callback)
+
+    @pytest.mark.asyncio
+    async def test_authorized_user_sends_embed(self, mock_role):
+        """Authorized user should get an embed reply on the target message."""
+        import discord
+
+        from bot import make_support_callback
+
+        config = {
+            "title": "📋 Log File Needed",
+            "message": "Please send logs",
+            "buttons": [
+                {"label": "Log Guide", "url": "https://example.com/logs"},
+                {"label": "Support", "url": "https://example.com/support"},
+            ],
+        }
+        callback = make_support_callback(config)
+
+        member = MagicMock(spec=discord.Member)
+        member.roles = [mock_role(99999)]
+        interaction = AsyncMock()
+        interaction.user = member
+        message = AsyncMock()
+
+        with patch("bot.AUTHORIZED_ROLE_ID", 99999):
+            await callback(interaction, message)
+
+        message.reply.assert_called_once()
+        call_kwargs = message.reply.call_args[1]
+        assert call_kwargs["mention_author"] is False
+        assert call_kwargs["embed"].title == "📋 Log File Needed"
+        assert call_kwargs["embed"].description == "Please send logs"
+
+        view = call_kwargs["view"]
+        assert len(view.children) == 2
+        assert view.children[0].label == "Log Guide"
+        assert view.children[0].url == "https://example.com/logs"
+        assert view.children[1].label == "Support"
+
+        interaction.response.send_message.assert_called_once_with("Sent!", ephemeral=True)
+
+    @pytest.mark.asyncio
+    async def test_unauthorized_user_rejected(self, mock_role):
+        """Unauthorized user should get an ephemeral rejection."""
+        import discord
+
+        from bot import make_support_callback
+
+        config = {"title": "Test", "message": "Test", "buttons": []}
+        callback = make_support_callback(config)
+
+        member = MagicMock(spec=discord.Member)
+        member.roles = [mock_role(11111)]
+        interaction = AsyncMock()
+        interaction.user = member
+        message = AsyncMock()
+
+        with patch("bot.AUTHORIZED_ROLE_ID", 99999):
+            await callback(interaction, message)
+
+        message.reply.assert_not_called()
+        interaction.response.send_message.assert_called_once_with(
+            "You don't have permission to use this.", ephemeral=True
+        )
+
+    @pytest.mark.asyncio
+    async def test_no_buttons_sends_embed_with_empty_view(self, mock_role):
+        """Support response with no buttons should still send an embed."""
+        import discord
+
+        from bot import make_support_callback
+
+        config = {"title": "Info", "message": "Some info", "buttons": []}
+        callback = make_support_callback(config)
+
+        member = MagicMock(spec=discord.Member)
+        member.roles = [mock_role(99999)]
+        interaction = AsyncMock()
+        interaction.user = member
+        message = AsyncMock()
+
+        with patch("bot.AUTHORIZED_ROLE_ID", 99999):
+            await callback(interaction, message)
+
+        message.reply.assert_called_once()
+        call_kwargs = message.reply.call_args[1]
+        assert len(call_kwargs["view"].children) == 0
+
+
 class TestGuildHandling:
     """Tests for guild-related edge cases."""
 

@@ -207,7 +207,8 @@ class TestOnReady:
 
         # dpytest already configures a mock user, just call on_ready
         # This tests the logging paths without crashing
-        await bot_module.on_ready()
+        with patch.object(bot_module.bot, "_tree_synced", True):
+            await bot_module.on_ready()
 
 
 class TestBotLifecycle:

@@ -20,15 +20,19 @@ No build step. Ruff handles both linting and formatting.
 Single-file bot: all logic lives in `bot.py` (~540 lines). No packages, no modules.
 
 Key sections in `bot.py`:
-- **Lines 1-100**: Config loading (secrets from .env, everything else from config.toml)
+- **Lines 1-110**: Config loading (secrets from .env, everything else from config.toml)
+- **`make_support_callback()`**: Factory that creates context menu callbacks for support responses. Each callback builds an embed + URL buttons from config and replies to the target message.
+- **`IssueBot.setup_hook()`**: Creates HTTP session and registers support response context menu commands from `SUPPORT_RESPONSES` config. Tree sync happens in `on_ready`.
 - **`init()`**: Creates OpenAI/GitHub clients. Called only from `__main__`, not at import time. This is intentional -- importing `bot` must be side-effect-free for tests.
 - **`process_reaction()`**: Core logic. Handles the full reaction -> issue creation flow.
 - **`create_github_issue()`**: Synchronous (PyGithub). Always called via `asyncio.to_thread()`.
 
 Config files:
 - `.env` -- Secrets only: `DISCORD_TOKEN`, `OPENAI_API_KEY`, `GITHUB_TOKEN` (gitignored)
-- `config.toml` -- All non-secret config: discord, github app, openai, files, bot behavior, projects, issue types (gitignored, loaded by `load_config()`)
+- `config.toml` -- All non-secret config: discord, github app, openai, files, bot behavior, projects, issue types, support responses (gitignored, loaded by `load_config()`)
 - `config.example.toml` / `.env.example` -- Templates shipped with the repo
+
+Support responses are configured as `[[support_responses]]` entries in config.toml. Each entry becomes a right-click (Apps) context menu command. Max 5 entries (Discord limit). Each has a `name`, `title`, `message`, and optional `buttons` array with `label`/`url` pairs.
 
 ## Testing
 
