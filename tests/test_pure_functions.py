@@ -1,7 +1,7 @@
 """Tests for pure functions that don't require external service mocking."""
 
 from datetime import UTC, datetime
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 
 class TestHasAuthorizedRole:
@@ -149,3 +149,112 @@ class TestCleanupPending:
             pending_projects.clear()
             cleanup_pending()
             assert len(pending_projects) == 0
+
+    def test_cleans_expired_recent_issues(self):
+        """Should remove expired recent_issues entries."""
+        from bot import RecentIssue, cleanup_pending, recent_issues
+
+        with (
+            patch("bot.PENDING_TIMEOUT", 60),
+            patch("bot.RECENT_ISSUE_TTL", 3600),
+            patch("bot.time") as mock_time,
+        ):
+            mock_time.monotonic.return_value = 5000.0
+
+            recent_issues[111] = [
+                RecentIssue(1, "repo/a", 1, 100, 1000.0),  # expired (4000s ago)
+                RecentIssue(2, "repo/b", 2, 200, 4500.0),  # valid (500s ago)
+            ]
+
+            cleanup_pending()
+
+            assert len(recent_issues[111]) == 1
+            assert recent_issues[111][0].issue_number == 2
+
+            recent_issues.clear()
+
+
+class TestEscapeMarkdownFilename:
+    """Tests for the _escape_markdown_filename function."""
+
+    def test_escapes_brackets_and_parens(self):
+        """Should escape markdown-injecting characters."""
+        from bot import _escape_markdown_filename
+
+        assert _escape_markdown_filename("normal.png") == "normal.png"
+        assert _escape_markdown_filename("file[1].png") == r"file\[1\].png"
+        assert _escape_markdown_filename("test](http://evil.com)[x") == (
+            r"test\]\(http://evil.com\)\[x"
+        )
+
+    def test_escapes_parentheses(self):
+        """Should escape parentheses."""
+        from bot import _escape_markdown_filename
+
+        assert _escape_markdown_filename("file(1).txt") == r"file\(1\).txt"
+
+
+class TestSegmentByTimeGap:
+    """Tests for the segment_by_time_gap function."""
+
+    def test_cuts_at_time_gap(self):
+        """Should return only messages after the last gap."""
+        from datetime import UTC, datetime
+
+        from bot import segment_by_time_gap
+
+        target = MagicMock()
+        target.created_at = datetime(2024, 1, 1, 12, 30, 0, tzinfo=UTC)
+
+        msgs = []
+        for minute in [10, 11, 12, 25, 26]:  # gap between 12 and 25
+            m = MagicMock()
+            m.created_at = datetime(2024, 1, 1, 12, minute, 0, tzinfo=UTC)
+            msgs.append(m)
+
+        result = segment_by_time_gap(msgs, target, gap_seconds=600)
+        # Should only include messages at :25 and :26 (after the gap)
+        assert len(result) == 2
+
+    def test_returns_empty_for_isolated_target(self):
+        """Should return empty if most recent candidate is too far from target."""
+        from datetime import UTC, datetime
+
+        from bot import segment_by_time_gap
+
+        target = MagicMock()
+        target.created_at = datetime(2024, 1, 1, 13, 0, 0, tzinfo=UTC)
+
+        msg = MagicMock()
+        msg.created_at = datetime(2024, 1, 1, 12, 0, 0, tzinfo=UTC)  # 1 hour ago
+
+        result = segment_by_time_gap([msg], target, gap_seconds=600)
+        assert result == []
+
+    def test_returns_empty_for_no_candidates(self):
+        """Should return empty for empty candidate list."""
+        from bot import segment_by_time_gap
+
+        result = segment_by_time_gap([], MagicMock(), gap_seconds=600)
+        assert result == []
+
+
+class TestRecordRecentIssue:
+    """Tests for the record_recent_issue function."""
+
+    def test_records_issue(self):
+        """Should add a RecentIssue entry to the channel's list."""
+        from bot import recent_issues, record_recent_issue
+
+        recent_issues.clear()
+        record_recent_issue(111, 999, "org/repo", 42, 12345)
+
+        assert 111 in recent_issues
+        assert len(recent_issues[111]) == 1
+        entry = recent_issues[111][0]
+        assert entry.bot_reply_msg_id == 999
+        assert entry.repo_name == "org/repo"
+        assert entry.issue_number == 42
+        assert entry.target_author_id == 12345
+
+        recent_issues.clear()

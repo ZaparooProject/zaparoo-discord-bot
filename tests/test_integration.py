@@ -49,16 +49,14 @@ def mock_github():
 
 
 @pytest.fixture
-def mock_openai():
-    """Mock OpenAI client for title generation."""
-    mock_response = MagicMock()
-    mock_response.choices = [MagicMock()]
-    mock_response.choices[0].message.content = "Test issue title from Discord"
+def mock_gemini():
+    """Mock Gemini client for title generation."""
+    mock_client = MagicMock()
+    mock_client.aio.models.generate_content = AsyncMock(
+        return_value=MagicMock(text="Test issue title from Discord")
+    )
 
-    mock_client = AsyncMock()
-    mock_client.chat.completions.create = AsyncMock(return_value=mock_response)
-
-    with patch("bot.openai_client", mock_client):
+    with patch("bot.gemini_client", mock_client):
         yield mock_client
 
 
@@ -113,7 +111,7 @@ class TestReactionFlow:
 
     @pytest.mark.asyncio
     async def test_issue_creation_flow(
-        self, bot_instance, mock_github, mock_openai, error_log_detector
+        self, bot_instance, mock_github, mock_gemini, error_log_detector
     ):
         """Full issue creation flow should work and send correct payload."""
 
@@ -164,10 +162,10 @@ class TestContextFiltering:
     """Tests for context message filtering."""
 
     @pytest.mark.asyncio
-    async def test_context_includes_target_author_messages(
-        self, bot_instance, mock_github, mock_openai
+    async def test_context_gathering_with_history(
+        self, bot_instance, mock_github, mock_gemini
     ):
-        """Context should include messages from the target author."""
+        """Context gathering should fetch channel history for issue body."""
 
         guild = dpytest.get_config().guilds[0]
         role = await guild.create_role(name="IssueCreator")
@@ -245,7 +243,7 @@ class TestAttachmentFlow:
     """Tests for attachment handling in issue creation."""
 
     @pytest.mark.asyncio
-    async def test_large_attachment_skipped(self, bot_instance, mock_github, mock_openai):
+    async def test_large_attachment_skipped(self, bot_instance, mock_github, mock_gemini):
         """Attachments over MAX_ATTACHMENT_SIZE should be skipped."""
 
         guild = dpytest.get_config().guilds[0]
@@ -334,7 +332,7 @@ class TestAttachmentFlow:
             assert files[0].read_bytes() == b"fake image data"
 
     @pytest.mark.asyncio
-    async def test_fallback_to_discord_url_on_save_failure(self, mock_github, mock_openai):
+    async def test_fallback_to_discord_url_on_save_failure(self, mock_github, mock_gemini):
         """When save_file_locally fails, should fall back to Discord URL."""
         from bot import process_reaction
 
@@ -412,7 +410,7 @@ class TestProjectSelection:
     """Tests for multi-project workflow."""
 
     @pytest.mark.asyncio
-    async def test_pending_project_used(self, bot_instance, mock_github, mock_openai):
+    async def test_pending_project_used(self, bot_instance, mock_github, mock_gemini):
         """Pending project selection should be used for issue creation."""
 
         from bot import pending_projects
@@ -472,7 +470,7 @@ class TestThreadSupport:
         assert channel_display == "#support → User issue discussion"
 
     @pytest.mark.asyncio
-    async def test_thread_context_only_from_thread(self, mock_github, mock_openai):
+    async def test_thread_context_only_from_thread(self, mock_github, mock_gemini):
         """Context gathering in threads should only get thread messages."""
         from bot import process_reaction
 
@@ -499,6 +497,7 @@ class TestThreadSupport:
         mock_message.reply = AsyncMock()
         mock_message.add_reaction = AsyncMock()
         mock_message.remove_reaction = AsyncMock()
+        mock_message.reference = None
 
         mock_thread.fetch_message = AsyncMock(return_value=mock_message)
 
@@ -553,7 +552,7 @@ class TestErrorHandling:
     """Tests for error handling scenarios."""
 
     @pytest.mark.asyncio
-    async def test_github_error_shows_failure(self, bot_instance, mock_openai, error_log_detector):
+    async def test_github_error_shows_failure(self, bot_instance, mock_gemini, error_log_detector):
         """GitHub API errors should show failure reaction."""
 
         guild = dpytest.get_config().guilds[0]

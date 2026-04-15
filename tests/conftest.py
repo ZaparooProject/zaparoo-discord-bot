@@ -124,6 +124,7 @@ def mock_message(mock_author):
         message.reply = AsyncMock()
         message.add_reaction = AsyncMock()
         message.remove_reaction = AsyncMock()
+        message.reference = None
         return message
 
     return _make_message

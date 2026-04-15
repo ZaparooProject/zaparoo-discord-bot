@@ -6,7 +6,7 @@
 #     "aiohttp>=3.9.0",
 #     "python-dotenv>=1.0.0",
 #     "PyGithub>=2.1.0",
-#     "openai>=1.0.0",
+#     "google-genai>=1.73.1",
 # ]
 # ///
 """
@@ -20,17 +20,19 @@ import asyncio
 import hashlib
 import logging
 import os
+import re
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import TypedDict
+from typing import NamedTuple, TypedDict
 
 import aiohttp
 import discord
-import openai
 from discord.ext import commands
 from dotenv import load_dotenv
 from github import Auth, Github
+from google import genai
+from google.genai import types
 
 logging.basicConfig(
     level=logging.INFO,
@@ -42,7 +44,7 @@ load_dotenv()
 
 # Secrets and deployment-specific settings from .env
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 AUTHORIZED_ROLE_ID = int(os.getenv("AUTHORIZED_ROLE_ID", "0"))
 _app_id = os.getenv("GITHUB_APP_ID")
@@ -53,10 +55,11 @@ GITHUB_APP_INSTALLATION_ID = int(_app_install) if _app_install else None
 IMAGES_URL = os.getenv("IMAGES_URL", "")
 
 # Hardcoded config
-OPENAI_MODEL = "gpt-4o"
+GEMINI_MODEL = "gemini-2.5-flash"
 IMAGES_DIR = Path("./images")
 MAX_ATTACHMENT_SIZE = 10_485_760
 CONTEXT_MESSAGES = 5
+CONTEXT_GAP_SECONDS = 600
 PENDING_TIMEOUT = 60
 
 PROJECTS = {
@@ -70,6 +73,22 @@ ISSUE_TYPES = {
     "🐛": "bug",
     "💡": "enhancement",
     "📋": None,
+}
+
+PROJECT_DESCRIPTIONS = {
+    "ZaparooProject/zaparoo-core": (
+        "Core: The main service that runs on hardware (MiSTer, Steam Deck, "
+        "Raspberry Pi, etc). Handles NFC tag reading/writing, launching games/media, "
+        "REST API server, hardware integration, platform readers, and system service."
+    ),
+    "ZaparooProject/zaparoo-app": (
+        "App: The mobile/desktop companion app. UI for browsing media libraries, "
+        "managing NFC cards, searching games, and configuring the core service remotely."
+    ),
+    "ZaparooProject/zaparoo-designer": (
+        "Designer: Web-based card and label design tool. Templates, custom artwork, "
+        "printing layouts, and label generation for NFC cards."
+    ),
 }
 
 
@@ -128,6 +147,18 @@ IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
 
 # Pending project selections: message_id -> (project_repo, project_name, timestamp)
 pending_projects: dict[int, tuple[str, str, float]] = {}
+
+class RecentIssue(NamedTuple):
+    bot_reply_msg_id: int
+    repo_name: str
+    issue_number: int
+    target_author_id: int
+    timestamp: float
+
+
+# Track recently created issues for follow-up attachment (channel_id -> entries)
+recent_issues: dict[int, list[RecentIssue]] = {}
+RECENT_ISSUE_TTL = 86400  # 24 hours
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -224,11 +255,16 @@ class CreateIssueModal(discord.ui.Modal, title="Create Issue"):
                 f"Created {project_name} issue #{issue_number}: <{issue_url}>",
                 ephemeral=True,
             )
-            await self.target_message.reply(
+            reply_msg = await self.target_message.reply(
                 f"Created {project_name} issue #{issue_number}: <{issue_url}>",
                 mention_author=False,
             )
             await self.target_message.add_reaction("✅")
+
+            record_recent_issue(
+                channel.id, reply_msg.id, repo_name, issue_number,
+                self.target_message.author.id,
+            )
         except Exception:
             logging.exception("Failed to create issue via context menu")
             try:
@@ -281,15 +317,15 @@ class IssueBot(commands.Bot):
 
 
 bot = IssueBot()
-openai_client: openai.AsyncOpenAI | None = None
+gemini_client: genai.Client | None = None
 github_client: Github | None = None
 
 
 def init():
     """Initialize API clients and create directories. Called at startup."""
-    global openai_client, github_client
+    global gemini_client, github_client
 
-    openai_client = openai.AsyncOpenAI(api_key=OPENAI_API_KEY)
+    gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 
     if GITHUB_APP_ID and GITHUB_APP_PRIVATE_KEY_PATH and GITHUB_APP_INSTALLATION_ID:
         private_key = Path(GITHUB_APP_PRIVATE_KEY_PATH).read_text()
@@ -305,32 +341,190 @@ def init():
 
 
 async def generate_issue_title(body: str) -> str:
-    """Generate a concise issue title using OpenAI."""
-    # Truncate to avoid token limits and costs
+    """Generate a concise issue title using Gemini."""
     truncated_body = body[:4000] if len(body) > 4000 else body
     try:
-        response = await openai_client.chat.completions.create(
-            model=OPENAI_MODEL,
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "Generate a GitHub issue title from the provided issue body. "
-                        "Write a short sentence (8-15 words) that describes the specific "
-                        "problem or request. Be descriptive and include relevant details. "
-                        "Output only the title, no quotes or prefixes. Use sentence case. "
-                        "Do not mention if there are attachments or not."
-                    ),
-                },
-                {"role": "user", "content": truncated_body},
-            ],
-            max_tokens=60,
-            temperature=0.3,
+        response = await gemini_client.aio.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=truncated_body,
+            config=types.GenerateContentConfig(
+                system_instruction=(
+                    "Generate a GitHub issue title from the provided issue body. "
+                    "Write a short sentence (8-15 words) that describes the specific "
+                    "problem or request. Be descriptive and include relevant details. "
+                    "Output only the title, no quotes or prefixes. Use sentence case. "
+                    "Do not mention if there are attachments or not."
+                ),
+                max_output_tokens=60,
+                temperature=0.3,
+            ),
         )
-        return response.choices[0].message.content.strip()
+        return response.text.strip()
     except Exception:
         logging.exception("Failed to generate title")
         return "Issue from Discord"
+
+
+async def detect_project(message_content: str) -> tuple[str, str] | None:
+    """Use Gemini to detect which project a message relates to.
+
+    Returns (repo_name, project_name) or None if unclear.
+    """
+    descriptions = "\n".join(f"- {repo}: {desc}" for repo, desc in PROJECT_DESCRIPTIONS.items())
+    try:
+        response = await gemini_client.aio.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=message_content,
+            config=types.GenerateContentConfig(
+                system_instruction=(
+                    "You classify Discord support messages to the correct project.\n\n"
+                    f"Projects:\n{descriptions}\n\n"
+                    "Based on the message, determine which project it relates to. "
+                    "Reply with ONLY the repository name (e.g., 'ZaparooProject/zaparoo-core'). "
+                    "If the message could apply to multiple projects or is unclear, "
+                    "reply 'unknown'."
+                ),
+                temperature=0.0,
+                max_output_tokens=30,
+            ),
+        )
+        result = response.text.strip()
+        for _, (repo, name) in PROJECTS.items():
+            if repo in result:
+                return repo, name
+    except Exception:
+        logging.exception("Failed to detect project")
+    return None
+
+
+async def walk_reply_chain(
+    message: discord.Message,
+    channel: discord.abc.Messageable,
+    max_depth: int = 10,
+) -> list[discord.Message]:
+    """Walk the reply chain from a message upward."""
+    chain = []
+    current = message
+    for _ in range(max_depth):
+        if not current.reference or not current.reference.message_id:
+            break
+        try:
+            parent = await channel.fetch_message(current.reference.message_id)
+            chain.append(parent)
+            current = parent
+        except Exception:
+            break
+    chain.reverse()
+    return chain
+
+
+def segment_by_time_gap(
+    candidates: list[discord.Message],
+    target_message: discord.Message,
+    gap_seconds: int = 600,
+) -> list[discord.Message]:
+    """Find messages in the same conversation as the target by walking backward."""
+    if not candidates:
+        return []
+
+    # Check if most recent candidate is close to target
+    most_recent = candidates[-1]
+    if (target_message.created_at - most_recent.created_at).total_seconds() > gap_seconds:
+        return []
+
+    segment = [most_recent]
+    for i in range(len(candidates) - 2, -1, -1):
+        gap = (candidates[i + 1].created_at - candidates[i].created_at).total_seconds()
+        if gap > gap_seconds:
+            break
+        segment.append(candidates[i])
+
+    segment.reverse()
+    return segment
+
+
+async def filter_context_with_llm(
+    target_message: discord.Message,
+    candidates: list[discord.Message],
+) -> list[discord.Message]:
+    """Use Gemini to filter context messages for relevance to the target."""
+    if not candidates:
+        return []
+
+    messages_text = "\n".join(
+        f"[{i}] {msg.author.display_name}: {msg.content}" for i, msg in enumerate(candidates)
+    )
+
+    prompt = (
+        f"Target message (the one being reported as an issue):\n"
+        f"{target_message.author.display_name}: {target_message.content}\n\n"
+        f"Candidate context messages:\n{messages_text}\n\n"
+        f"Which of these messages are about the same topic/issue as the target? "
+        f"Return ONLY the indices as comma-separated numbers (e.g., '0,2,5'). "
+        f"If none are relevant, return 'none'."
+    )
+
+    response = await gemini_client.aio.models.generate_content(
+        model=GEMINI_MODEL,
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            system_instruction=(
+                "You filter Discord messages for relevance to a specific issue report. "
+                "Include messages that discuss the same problem, provide additional context, "
+                "share related experiences, or contain relevant error messages/logs. "
+                "Exclude unrelated conversations, greetings, and off-topic messages."
+            ),
+            temperature=0.0,
+            max_output_tokens=100,
+        ),
+    )
+
+    if not response.text:
+        return candidates[:CONTEXT_MESSAGES]
+
+    result_text = response.text.strip().lower()
+    if result_text == "none":
+        return []
+
+    try:
+        indices = [int(x.strip()) for x in result_text.split(",")]
+        return [candidates[i] for i in indices if 0 <= i < len(candidates)]
+    except (ValueError, IndexError):
+        logging.warning(f"Could not parse LLM context filter response: {result_text}")
+        return candidates[:CONTEXT_MESSAGES]
+
+
+async def gather_context(
+    target_message: discord.Message,
+    channel: discord.abc.Messageable,
+) -> list[discord.Message]:
+    """Gather relevant context using reply chains, time gaps, and LLM filtering."""
+    # Step 1: Walk reply chain
+    reply_chain = await walk_reply_chain(target_message, channel)
+    if len(reply_chain) >= 2:
+        return reply_chain
+
+    # Step 2: Fetch larger window and segment by time gaps
+    candidates = []
+    try:
+        async for msg in channel.history(limit=50, before=target_message):
+            candidates.append(msg)
+        candidates.reverse()
+    except Exception:
+        logging.exception("Could not fetch history")
+        return reply_chain
+
+    segmented = segment_by_time_gap(candidates, target_message, CONTEXT_GAP_SECONDS)
+    if not segmented:
+        return reply_chain
+
+    # Step 3: LLM filtering
+    try:
+        filtered = await filter_context_with_llm(target_message, segmented)
+        return filtered if filtered else reply_chain
+    except Exception:
+        logging.exception("LLM context filtering failed, using time-segmented results")
+        return segmented[:CONTEXT_MESSAGES]
 
 
 async def download_attachment(session: aiohttp.ClientSession, url: str) -> tuple[bytes | None, str]:
@@ -364,6 +558,11 @@ async def save_file_locally(data: bytes, original_filename: str) -> str | None:
     await asyncio.to_thread(filepath.write_bytes, data)
 
     return f"{IMAGES_URL.rstrip('/')}/{filename}"
+
+
+def _escape_markdown_filename(filename: str) -> str:
+    """Escape characters that could inject markdown in ![name](url) links."""
+    return filename.replace("[", r"\[").replace("]", r"\]").replace("(", r"\(").replace(")", r"\)")
 
 
 def format_message_for_issue(message: discord.Message, is_target: bool = False) -> str:
@@ -404,6 +603,62 @@ def create_github_issue(
     return issue.number, issue.html_url
 
 
+def add_comment_to_issue(repo_name: str, issue_number: int, body: str) -> str:
+    """Add a comment to a GitHub issue. Returns comment URL. Synchronous (PyGithub)."""
+    repo = github_client.get_repo(repo_name)
+    issue = repo.get_issue(number=issue_number)
+    comment = issue.create_comment(body)
+    return comment.html_url
+
+
+async def build_followup_comment(message: discord.Message) -> str:
+    """Build a markdown comment from a follow-up Discord message, including attachments."""
+    parts = ["*Follow-up from Discord*", ""]
+    parts.append(format_message_for_issue(message))
+    parts.append("")
+
+    attachment_urls = []
+    for attachment in message.attachments:
+        ext = Path(attachment.filename).suffix.lower()
+        if ext in ALLOWED_FILE_EXTENSIONS:
+            if attachment.size > MAX_ATTACHMENT_SIZE:
+                continue
+            data, filename = await download_attachment(bot.http_session, attachment.url)
+            if data:
+                local_url = await save_file_locally(data, filename)
+                if local_url:
+                    attachment_urls.append((attachment.filename, local_url))
+                    continue
+            attachment_urls.append((attachment.filename, attachment.url))
+
+    if attachment_urls:
+        parts.append("### Attachments")
+        parts.append("")
+        for filename, url in attachment_urls:
+            safe_name = _escape_markdown_filename(filename)
+            ext = Path(filename).suffix.lower()
+            if ext in IMAGE_EXTENSIONS:
+                parts.append(f"![{safe_name}]({url})")
+            else:
+                parts.append(f"[{safe_name}]({url})")
+        parts.append("")
+
+    return "\n".join(parts)
+
+
+def record_recent_issue(
+    channel_id: int, bot_reply_msg_id: int, repo_name: str,
+    issue_number: int, target_author_id: int,
+):
+    """Record a recently created issue for follow-up attachment."""
+    cleanup_pending()
+    if channel_id not in recent_issues:
+        recent_issues[channel_id] = []
+    recent_issues[channel_id].append(RecentIssue(
+        bot_reply_msg_id, repo_name, issue_number, target_author_id, time.monotonic(),
+    ))
+
+
 async def create_issue_from_message(
     target_message: discord.Message,
     channel: discord.abc.Messageable,
@@ -416,21 +671,8 @@ async def create_issue_from_message(
 
     Returns (issue_number, issue_url). Raises on failure.
     """
-    # Fetch context messages (only from target author or users with authorized role)
-    target_author_id = target_message.author.id
-    context_messages = []
-    try:
-        async for msg in channel.history(limit=10, before=target_message):
-            msg_member = guild.get_member(msg.author.id)
-            if msg.author.id == target_author_id or (
-                msg_member and has_authorized_role(msg_member)
-            ):
-                context_messages.append(msg)
-                if len(context_messages) >= CONTEXT_MESSAGES:
-                    break
-        context_messages.reverse()
-    except Exception:
-        logging.exception("Could not fetch context")
+    # Gather relevant context using smart filtering
+    context_messages = await gather_context(target_message, channel)
 
     # Process attachments
     attachment_urls = []
@@ -490,11 +732,12 @@ async def create_issue_from_message(
         body_parts.append("### Attachments")
         body_parts.append("")
         for filename, url in attachment_urls:
+            safe_name = _escape_markdown_filename(filename)
             ext = Path(filename).suffix.lower()
             if ext in IMAGE_EXTENSIONS:
-                body_parts.append(f"![{filename}]({url})")
+                body_parts.append(f"![{safe_name}]({url})")
             else:
-                body_parts.append(f"[{filename}]({url})")
+                body_parts.append(f"[{safe_name}]({url})")
         body_parts.append("")
 
     body = "\n".join(body_parts)
@@ -517,7 +760,7 @@ async def create_issue_from_message(
 
 
 def cleanup_pending():
-    """Remove expired pending project selections."""
+    """Remove expired pending project selections and old recent issues."""
     now = time.monotonic()
     expired = [
         msg_id
@@ -526,6 +769,14 @@ def cleanup_pending():
     ]
     for msg_id in expired:
         del pending_projects[msg_id]
+
+    for channel_id in list(recent_issues):
+        recent_issues[channel_id] = [
+            entry for entry in recent_issues[channel_id]
+            if now - entry.timestamp <= RECENT_ISSUE_TTL
+        ]
+        if not recent_issues[channel_id]:
+            del recent_issues[channel_id]
 
 
 def has_authorized_role(member: discord.Member) -> bool:
@@ -569,19 +820,7 @@ async def process_reaction(payload: discord.RawReactionActionEvent):
                 pass
         return
 
-    # Check if this is an issue type
-    if emoji not in ISSUE_TYPES:
-        return
-
-    label = ISSUE_TYPES[emoji]
-
-    # Get project (from pending or default)
-    if message_id in pending_projects:
-        repo_name, project_name = pending_projects.pop(message_id)[:2]
-    else:
-        repo_name, project_name = DEFAULT_PROJECT
-
-    # Fetch channel
+    # Fetch channel (needed for all paths below)
     channel = bot.get_channel(payload.channel_id)
     if not channel:
         try:
@@ -590,12 +829,73 @@ async def process_reaction(payload: discord.RawReactionActionEvent):
             logging.exception("Could not fetch channel")
             return
 
+    # Handle 📎 follow-up attachment
+    if emoji == "📎":
+        entries = recent_issues.get(payload.channel_id, [])
+        if not entries:
+            return
+        try:
+            target_message = await channel.fetch_message(message_id)
+        except Exception:
+            return
+        # Find most recent issue from this message's author
+        author_id = target_message.author.id
+        match = None
+        for entry in reversed(entries):
+            if entry.target_author_id == author_id:
+                match = entry
+                break
+        if not match:
+            return
+        try:
+            await target_message.remove_reaction("📎", payload.member)
+            await target_message.add_reaction("⏳")
+        except Exception:
+            pass
+        try:
+            comment_body = await build_followup_comment(target_message)
+            comment_url = await asyncio.to_thread(
+                add_comment_to_issue, match.repo_name, match.issue_number, comment_body
+            )
+            await target_message.remove_reaction("⏳", bot.user)
+            await target_message.add_reaction("✅")
+            await target_message.reply(
+                f"Attached to issue #{match.issue_number}: <{comment_url}>",
+                mention_author=False,
+            )
+            logging.info(f"Attached follow-up to issue #{match.issue_number}")
+        except Exception:
+            logging.exception("Failed to attach follow-up")
+            try:
+                await target_message.remove_reaction("⏳", bot.user)
+                await target_message.add_reaction("❌")
+            except Exception:
+                pass
+        return
+
+    # Check if this is an issue type
+    if emoji not in ISSUE_TYPES:
+        return
+
+    label = ISSUE_TYPES[emoji]
+
     # Fetch target message
     try:
         target_message = await channel.fetch_message(message_id)
     except Exception:
         logging.exception("Could not fetch message")
         return
+
+    # Get project (from pending, auto-detect, or default)
+    if message_id in pending_projects:
+        repo_name, project_name = pending_projects.pop(message_id)[:2]
+    else:
+        detected = await detect_project(target_message.content)
+        if detected:
+            repo_name, project_name = detected
+            logging.info(f"Auto-detected project: {project_name}")
+        else:
+            repo_name, project_name = DEFAULT_PROJECT
 
     # Remove pending indicator if present
     try:
@@ -609,11 +909,15 @@ async def process_reaction(payload: discord.RawReactionActionEvent):
             target_message, channel, guild, repo_name, project_name, label,
         )
 
-        await target_message.reply(
+        reply_msg = await target_message.reply(
             f"Created {project_name} issue #{issue_number}: <{issue_url}>",
             mention_author=False,
         )
         await target_message.add_reaction("✅")
+
+        record_recent_issue(
+            channel.id, reply_msg.id, repo_name, issue_number, target_message.author.id,
+        )
 
     except Exception:
         logging.exception("Failed to create issue")
@@ -652,6 +956,71 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
     await process_reaction(payload)
 
 
+@bot.event
+async def on_message(message: discord.Message):
+    """Handle messages — detect replies to bot issue confirmations for follow-up attachment."""
+    await bot.process_commands(message)
+
+    if message.author.bot:
+        return
+    if not message.reference or not message.reference.message_id:
+        return
+    if not message.guild:
+        return
+
+    # Fetch the referenced message
+    try:
+        ref_msg = message.reference.resolved or await message.channel.fetch_message(
+            message.reference.message_id
+        )
+    except Exception:
+        return
+
+    # Check if replying to a bot issue-creation message (not follow-up confirmations)
+    if ref_msg.author != bot.user or not ref_msg.content.startswith("Created "):
+        return
+
+    # Authorization: original issue author OR authorized role member
+    member = message.guild.get_member(message.author.id)
+    is_authorized = member and has_authorized_role(member)
+
+    # Check if user is the original issue author
+    entries = recent_issues.get(message.channel.id, [])
+    is_original_author = any(
+        entry.bot_reply_msg_id == ref_msg.id and entry.target_author_id == message.author.id
+        for entry in entries
+    )
+
+    if not is_authorized and not is_original_author:
+        return
+
+    # Parse issue info from the bot message URL
+    match = re.search(r"<(https://github\.com/([^/]+/[^/]+)/issues/(\d+))>", ref_msg.content)
+    if not match:
+        return
+
+    repo_name = match.group(2)
+    issue_number = int(match.group(3))
+
+    # Validate repo is a known project
+    if not any(repo == repo_name for _, (repo, _) in PROJECTS.items()):
+        return
+
+    try:
+        comment_body = await build_followup_comment(message)
+        comment_url = await asyncio.to_thread(
+            add_comment_to_issue, repo_name, issue_number, comment_body
+        )
+        await message.add_reaction("📎")
+        await message.reply(
+            f"Attached to issue #{issue_number}: <{comment_url}>",
+            mention_author=False,
+        )
+        logging.info(f"Attached reply follow-up to issue #{issue_number}")
+    except Exception:
+        logging.exception("Failed to attach reply follow-up")
+
+
 @bot.command()
 async def help(ctx):
     """Show help for the issue bot."""
@@ -670,7 +1039,7 @@ async def help(ctx):
 2. React with issue type to create issue
 
 **Single-step flow:**
-- Just react with issue type → uses default project ({default_name})
+- Just react with issue type → bot auto-detects project (fallback: {default_name})
 
 **Projects:**
 {projects_list}
@@ -680,9 +1049,13 @@ async def help(ctx):
 💡 = Feature request (`enhancement` label)
 📋 = General issue (no label)
 
+**Follow-up:**
+📎 = React on a message to attach it to the most recent issue
+Or reply to the bot's issue confirmation message
+
 **Example:**
 - React 📱 then 🐛 → Bug on App
-- React 🐛 only → Bug on {default_name}
+- React 🐛 only → Bug on auto-detected project
 """
     await ctx.send(help_text)
 
@@ -698,8 +1071,8 @@ if __name__ == "__main__":
     if not AUTHORIZED_ROLE_ID:
         print("Error: AUTHORIZED_ROLE_ID not set in .env")
         exit(1)
-    if not OPENAI_API_KEY:
-        print("Error: OPENAI_API_KEY not set")
+    if not GEMINI_API_KEY:
+        print("Error: GEMINI_API_KEY not set")
         exit(1)
 
     init()

@@ -84,7 +84,7 @@ uv run bot.py
 | Variable | Required | Description |
 |----------|----------|-------------|
 | `DISCORD_TOKEN` | Yes | Discord bot token |
-| `OPENAI_API_KEY` | Yes | OpenAI API key for generating issue titles |
+| `GEMINI_API_KEY` | Yes | Google Gemini API key for AI features |
 | `AUTHORIZED_ROLE_ID` | Yes | Discord role ID for authorized users |
 | `GITHUB_TOKEN` | Yes* | GitHub personal access token |
 | `GITHUB_APP_ID` | Yes* | GitHub App ID (alternative to token) |

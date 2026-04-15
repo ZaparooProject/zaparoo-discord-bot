@@ -13,70 +13,65 @@ class TestGenerateIssueTitle:
         """Successful API call should return generated title."""
         from bot import generate_issue_title
 
-        mock_response = MagicMock()
-        mock_response.choices = [MagicMock()]
-        mock_response.choices[0].message.content = "  User reports app crash on startup  "
+        mock_client = MagicMock()
+        mock_client.aio.models.generate_content = AsyncMock(
+            return_value=MagicMock(text="  User reports app crash on startup  ")
+        )
 
-        mock_client = AsyncMock()
-        mock_client.chat.completions.create = AsyncMock(return_value=mock_response)
-
-        with patch("bot.openai_client", mock_client):
+        with patch("bot.gemini_client", mock_client):
             title = await generate_issue_title("The app crashes when I open it")
 
             assert title == "User reports app crash on startup"
-            mock_client.chat.completions.create.assert_called_once()
+            mock_client.aio.models.generate_content.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_truncates_long_body(self):
         """Long body should be truncated to 4000 chars."""
         from bot import generate_issue_title
 
-        mock_response = MagicMock()
-        mock_response.choices = [MagicMock()]
-        mock_response.choices[0].message.content = "Generated title"
-
-        mock_client = AsyncMock()
-        mock_client.chat.completions.create = AsyncMock(return_value=mock_response)
+        mock_client = MagicMock()
+        mock_client.aio.models.generate_content = AsyncMock(
+            return_value=MagicMock(text="Generated title")
+        )
 
         long_body = "x" * 5000
 
-        with patch("bot.openai_client", mock_client):
+        with patch("bot.gemini_client", mock_client):
             await generate_issue_title(long_body)
 
-            call_args = mock_client.chat.completions.create.call_args
-            user_message = call_args.kwargs["messages"][1]["content"]
-            assert len(user_message) == 4000
+            call_args = mock_client.aio.models.generate_content.call_args
+            assert len(call_args.kwargs["contents"]) == 4000
 
     @pytest.mark.asyncio
     async def test_api_failure_returns_fallback(self):
         """API failure should return fallback title."""
         from bot import generate_issue_title
 
-        mock_client = AsyncMock()
-        mock_client.chat.completions.create = AsyncMock(side_effect=Exception("API Error"))
+        mock_client = MagicMock()
+        mock_client.aio.models.generate_content = AsyncMock(
+            side_effect=Exception("API Error")
+        )
 
-        with patch("bot.openai_client", mock_client):
+        with patch("bot.gemini_client", mock_client):
             title = await generate_issue_title("Some issue body")
 
             assert title == "Issue from Discord"
 
     @pytest.mark.asyncio
     async def test_uses_configured_model(self):
-        """Should use the configured OPENAI_MODEL."""
+        """Should use the configured GEMINI_MODEL."""
         from bot import generate_issue_title
 
-        mock_response = MagicMock()
-        mock_response.choices = [MagicMock()]
-        mock_response.choices[0].message.content = "Title"
+        mock_client = MagicMock()
+        mock_client.aio.models.generate_content = AsyncMock(
+            return_value=MagicMock(text="Title")
+        )
 
-        mock_client = AsyncMock()
-        mock_client.chat.completions.create = AsyncMock(return_value=mock_response)
-
-        with patch("bot.openai_client", mock_client), patch("bot.OPENAI_MODEL", "gpt-4o-mini"):
+        with patch("bot.gemini_client", mock_client), patch("bot.GEMINI_MODEL", "gemini-2.5-pro"):
             await generate_issue_title("Body")
 
-            call_args = mock_client.chat.completions.create.call_args
-            assert call_args.kwargs["model"] == "gpt-4o-mini"
+            call_args = mock_client.aio.models.generate_content.call_args
+            assert call_args.kwargs["model"] == "gemini-2.5-pro"
 
 
 class TestCreateGithubIssue:
@@ -319,17 +314,15 @@ class TestProcessReaction:
             mock_github = MagicMock()
             mock_github.get_repo.return_value = mock_repo
 
-            mock_openai_response = MagicMock()
-            mock_openai_response.choices = [MagicMock()]
-            mock_openai_response.choices[0].message.content = "Test title"
-
-            mock_openai = AsyncMock()
-            mock_openai.chat.completions.create = AsyncMock(return_value=mock_openai_response)
+            mock_gemini = MagicMock()
+            mock_gemini.aio.models.generate_content = AsyncMock(
+                return_value=MagicMock(text="Test title")
+            )
 
             with (
                 patch("bot.bot") as mock_bot,
                 patch("bot.github_client", mock_github),
-                patch("bot.openai_client", mock_openai),
+                patch("bot.gemini_client", mock_gemini),
             ):
                 mock_bot.get_guild.return_value = mock_guild
                 mock_bot.get_channel.return_value = channel
@@ -384,17 +377,15 @@ class TestChannelFetching:
             mock_github = MagicMock()
             mock_github.get_repo.return_value = mock_repo
 
-            mock_openai_response = MagicMock()
-            mock_openai_response.choices = [MagicMock()]
-            mock_openai_response.choices[0].message.content = "Title"
-
-            mock_openai = AsyncMock()
-            mock_openai.chat.completions.create = AsyncMock(return_value=mock_openai_response)
+            mock_gemini = MagicMock()
+            mock_gemini.aio.models.generate_content = AsyncMock(
+                return_value=MagicMock(text="Title")
+            )
 
             with (
                 patch("bot.bot") as mock_bot,
                 patch("bot.github_client", mock_github),
-                patch("bot.openai_client", mock_openai),
+                patch("bot.gemini_client", mock_gemini),
             ):
                 mock_bot.get_guild.return_value = mock_guild
                 # Channel not in cache
@@ -585,11 +576,9 @@ class TestCreateIssueFromMessage:
         guild = MagicMock(spec=discord.Guild)
         guild.id = 789
 
-        mock_openai = AsyncMock()
-        mock_openai.chat.completions.create = AsyncMock(
-            return_value=MagicMock(
-                choices=[MagicMock(message=MagicMock(content="App crashes on startup"))]
-            )
+        mock_gemini = MagicMock()
+        mock_gemini.aio.models.generate_content = AsyncMock(
+            return_value=MagicMock(text="App crashes on startup")
         )
 
         mock_github_issue = MagicMock()
@@ -604,7 +593,7 @@ class TestCreateIssueFromMessage:
         mock_github.get_repo.return_value = mock_github_repo
 
         with (
-            patch("bot.openai_client", mock_openai),
+            patch("bot.gemini_client", mock_gemini),
             patch("bot.github_client", mock_github),
             patch("bot.bot") as mock_bot,
         ):
@@ -648,11 +637,9 @@ class TestCreateIssueFromMessage:
         guild = MagicMock(spec=discord.Guild)
         guild.id = 789
 
-        mock_openai = AsyncMock()
-        mock_openai.chat.completions.create = AsyncMock(
-            return_value=MagicMock(
-                choices=[MagicMock(message=MagicMock(content="General question"))]
-            )
+        mock_gemini = MagicMock()
+        mock_gemini.aio.models.generate_content = AsyncMock(
+            return_value=MagicMock(text="General question")
         )
 
         mock_github_issue = MagicMock()
@@ -665,7 +652,7 @@ class TestCreateIssueFromMessage:
         mock_github.get_repo.return_value = mock_github_repo
 
         with (
-            patch("bot.openai_client", mock_openai),
+            patch("bot.gemini_client", mock_gemini),
             patch("bot.github_client", mock_github),
             patch("bot.bot") as mock_bot,
         ):
@@ -760,11 +747,9 @@ class TestCreateIssueModal:
 
         interaction = AsyncMock()
 
-        mock_openai = AsyncMock()
-        mock_openai.chat.completions.create = AsyncMock(
-            return_value=MagicMock(
-                choices=[MagicMock(message=MagicMock(content="Bug report title"))]
-            )
+        mock_gemini = MagicMock()
+        mock_gemini.aio.models.generate_content = AsyncMock(
+            return_value=MagicMock(text="Bug report title")
         )
 
         mock_github_issue = MagicMock()
@@ -779,7 +764,7 @@ class TestCreateIssueModal:
         mock_github.get_repo.return_value = mock_github_repo
 
         with (
-            patch("bot.openai_client", mock_openai),
+            patch("bot.gemini_client", mock_gemini),
             patch("bot.github_client", mock_github),
             patch("bot.bot") as mock_bot,
         ):
@@ -831,11 +816,9 @@ class TestCreateIssueModal:
 
         interaction = AsyncMock()
 
-        mock_openai = AsyncMock()
-        mock_openai.chat.completions.create = AsyncMock(
-            return_value=MagicMock(
-                choices=[MagicMock(message=MagicMock(content="General title"))]
-            )
+        mock_gemini = MagicMock()
+        mock_gemini.aio.models.generate_content = AsyncMock(
+            return_value=MagicMock(text="General title")
         )
 
         mock_github_issue = MagicMock()
@@ -848,7 +831,7 @@ class TestCreateIssueModal:
         mock_github.get_repo.return_value = mock_github_repo
 
         with (
-            patch("bot.openai_client", mock_openai),
+            patch("bot.gemini_client", mock_gemini),
             patch("bot.github_client", mock_github),
             patch("bot.bot") as mock_bot,
         ):
@@ -926,3 +909,235 @@ class TestGuildHandling:
 
                 # Should complete without error
                 await process_reaction(payload)
+
+
+class TestDetectProject:
+    """Tests for the detect_project function."""
+
+    @pytest.mark.asyncio
+    async def test_detects_correct_project(self):
+        """Should return the matching project when LLM identifies it."""
+        from bot import detect_project
+
+        mock_client = MagicMock()
+        mock_client.aio.models.generate_content = AsyncMock(
+            return_value=MagicMock(text="ZaparooProject/zaparoo-app")
+        )
+
+        with patch("bot.gemini_client", mock_client):
+            result = await detect_project("The app crashes when I tap a card")
+
+        assert result == ("ZaparooProject/zaparoo-app", "App")
+
+    @pytest.mark.asyncio
+    async def test_returns_none_for_unknown(self):
+        """Should return None when LLM says unknown."""
+        from bot import detect_project
+
+        mock_client = MagicMock()
+        mock_client.aio.models.generate_content = AsyncMock(
+            return_value=MagicMock(text="unknown")
+        )
+
+        with patch("bot.gemini_client", mock_client):
+            result = await detect_project("Some vague question")
+
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_returns_none_on_failure(self):
+        """Should return None when LLM call fails."""
+        from bot import detect_project
+
+        mock_client = MagicMock()
+        mock_client.aio.models.generate_content = AsyncMock(
+            side_effect=Exception("API Error")
+        )
+
+        with patch("bot.gemini_client", mock_client):
+            result = await detect_project("Some message")
+
+        assert result is None
+
+
+class TestWalkReplyChain:
+    """Tests for the walk_reply_chain function."""
+
+    @pytest.mark.asyncio
+    async def test_follows_reply_references(self):
+        """Should walk the reply chain upward."""
+        from bot import walk_reply_chain
+
+        msg3 = MagicMock()
+        msg3.reference = None
+
+        msg2 = MagicMock()
+        msg2.reference = MagicMock()
+        msg2.reference.message_id = 300
+
+        msg1 = MagicMock()
+        msg1.reference = MagicMock()
+        msg1.reference.message_id = 200
+
+        channel = MagicMock()
+        channel.fetch_message = AsyncMock(side_effect=[msg2, msg3])
+
+        chain = await walk_reply_chain(msg1, channel)
+        assert len(chain) == 2
+        assert chain[0] is msg3  # reversed: oldest first
+        assert chain[1] is msg2
+
+    @pytest.mark.asyncio
+    async def test_stops_at_no_reference(self):
+        """Should stop when message has no reference."""
+        from bot import walk_reply_chain
+
+        msg = MagicMock()
+        msg.reference = None
+
+        channel = MagicMock()
+        chain = await walk_reply_chain(msg, channel)
+        assert chain == []
+
+    @pytest.mark.asyncio
+    async def test_stops_on_fetch_error(self):
+        """Should stop when fetch_message fails."""
+        from bot import walk_reply_chain
+
+        msg = MagicMock()
+        msg.reference = MagicMock()
+        msg.reference.message_id = 123
+
+        channel = MagicMock()
+        channel.fetch_message = AsyncMock(side_effect=Exception("Not found"))
+
+        chain = await walk_reply_chain(msg, channel)
+        assert chain == []
+
+
+class TestFilterContextWithLlm:
+    """Tests for the filter_context_with_llm function."""
+
+    @pytest.mark.asyncio
+    async def test_returns_filtered_messages(self):
+        """Should return messages at the indices the LLM specifies."""
+        from bot import filter_context_with_llm
+
+        msgs = [MagicMock(author=MagicMock(display_name=f"User{i}"), content=f"msg{i}")
+                for i in range(5)]
+        target = MagicMock(author=MagicMock(display_name="Reporter"), content="bug report")
+
+        mock_client = MagicMock()
+        mock_client.aio.models.generate_content = AsyncMock(
+            return_value=MagicMock(text="1,3")
+        )
+
+        with patch("bot.gemini_client", mock_client):
+            result = await filter_context_with_llm(target, msgs)
+
+        assert result == [msgs[1], msgs[3]]
+
+    @pytest.mark.asyncio
+    async def test_returns_empty_for_none_response(self):
+        """Should return empty list when LLM says none are relevant."""
+        from bot import filter_context_with_llm
+
+        msgs = [MagicMock(author=MagicMock(display_name="User"), content="hello")]
+        target = MagicMock(author=MagicMock(display_name="Reporter"), content="bug")
+
+        mock_client = MagicMock()
+        mock_client.aio.models.generate_content = AsyncMock(
+            return_value=MagicMock(text="none")
+        )
+
+        with patch("bot.gemini_client", mock_client):
+            result = await filter_context_with_llm(target, msgs)
+
+        assert result == []
+
+    @pytest.mark.asyncio
+    async def test_fallback_on_null_response(self):
+        """Should fall back to first N candidates when response.text is None."""
+        from bot import filter_context_with_llm
+
+        msgs = [MagicMock(author=MagicMock(display_name=f"User{i}"), content=f"msg{i}")
+                for i in range(10)]
+        target = MagicMock(author=MagicMock(display_name="Reporter"), content="bug")
+
+        mock_client = MagicMock()
+        mock_client.aio.models.generate_content = AsyncMock(
+            return_value=MagicMock(text=None)
+        )
+
+        with patch("bot.gemini_client", mock_client), patch("bot.CONTEXT_MESSAGES", 3):
+            result = await filter_context_with_llm(target, msgs)
+
+        assert result == msgs[:3]
+
+    @pytest.mark.asyncio
+    async def test_fallback_on_unparseable_response(self):
+        """Should fall back when LLM response can't be parsed as indices."""
+        from bot import filter_context_with_llm
+
+        msgs = [MagicMock(author=MagicMock(display_name="User"), content="msg")]
+        target = MagicMock(author=MagicMock(display_name="Reporter"), content="bug")
+
+        mock_client = MagicMock()
+        mock_client.aio.models.generate_content = AsyncMock(
+            return_value=MagicMock(text="these messages are relevant: 0")
+        )
+
+        with patch("bot.gemini_client", mock_client), patch("bot.CONTEXT_MESSAGES", 5):
+            result = await filter_context_with_llm(target, msgs)
+
+        assert result == msgs[:5]
+
+
+class TestAddCommentToIssue:
+    """Tests for the add_comment_to_issue function."""
+
+    def test_creates_comment(self):
+        """Should call PyGithub to create a comment."""
+        from bot import add_comment_to_issue
+
+        mock_comment = MagicMock()
+        mock_comment.html_url = "https://github.com/org/repo/issues/42#issuecomment-1"
+
+        mock_issue = MagicMock()
+        mock_issue.create_comment.return_value = mock_comment
+
+        mock_repo = MagicMock()
+        mock_repo.get_issue.return_value = mock_issue
+
+        mock_client = MagicMock()
+        mock_client.get_repo.return_value = mock_repo
+
+        with patch("bot.github_client", mock_client):
+            url = add_comment_to_issue("org/repo", 42, "Follow-up body")
+
+        assert url == "https://github.com/org/repo/issues/42#issuecomment-1"
+        mock_repo.get_issue.assert_called_once_with(number=42)
+        mock_issue.create_comment.assert_called_once_with("Follow-up body")
+
+
+class TestBuildFollowupComment:
+    """Tests for the build_followup_comment function."""
+
+    @pytest.mark.asyncio
+    async def test_builds_comment_with_text(self):
+        """Should build a markdown comment from a message."""
+        from bot import build_followup_comment
+
+        message = MagicMock()
+        message.content = "Here are the logs"
+        message.author.display_name = "TestUser"
+        message.author.name = "testuser"
+        message.created_at.strftime.return_value = "2024-01-15 10:30 UTC"
+        message.attachments = []
+
+        with patch("bot.bot") as mock_bot:
+            mock_bot.http_session = MagicMock()
+            result = await build_followup_comment(message)
+
+        assert "*Follow-up from Discord*" in result
+        assert "Here are the logs" in result
