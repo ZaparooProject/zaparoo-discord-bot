@@ -553,6 +553,363 @@ class TestSupportResponses:
         assert len(call_kwargs["view"].children) == 0
 
 
+class TestCreateIssueFromMessage:
+    """Tests for the extracted create_issue_from_message function."""
+
+    @pytest.mark.asyncio
+    async def test_creates_issue_and_returns_result(self):
+        """Should gather context, generate title, and create a GitHub issue."""
+        import discord
+
+        from bot import create_issue_from_message
+
+        target_message = MagicMock(spec=discord.Message)
+        target_message.author.id = 123
+        target_message.author.display_name = "TestUser"
+        target_message.author.name = "testuser"
+        target_message.content = "App crashes on startup"
+        target_message.created_at.strftime.return_value = "2024-01-01 00:00 UTC"
+        target_message.attachments = []
+        target_message.id = 999
+
+        async def empty_history():
+            return
+            yield
+
+        channel = MagicMock()
+        channel.id = 456
+        channel.name = "support"
+        channel.guild.name = "Test Server"
+        channel.history = MagicMock(return_value=empty_history())
+
+        guild = MagicMock(spec=discord.Guild)
+        guild.id = 789
+
+        mock_openai = AsyncMock()
+        mock_openai.chat.completions.create = AsyncMock(
+            return_value=MagicMock(
+                choices=[MagicMock(message=MagicMock(content="App crashes on startup"))]
+            )
+        )
+
+        mock_github_issue = MagicMock()
+        mock_github_issue.number = 42
+        mock_github_issue.html_url = "https://github.com/org/repo/issues/42"
+        label_bug = MagicMock()
+        label_bug.name = "bug"
+        mock_github_repo = MagicMock()
+        mock_github_repo.get_labels.return_value = [label_bug]
+        mock_github_repo.create_issue.return_value = mock_github_issue
+        mock_github = MagicMock()
+        mock_github.get_repo.return_value = mock_github_repo
+
+        with (
+            patch("bot.openai_client", mock_openai),
+            patch("bot.github_client", mock_github),
+            patch("bot.bot") as mock_bot,
+        ):
+            mock_bot.http_session = AsyncMock()
+            issue_number, issue_url = await create_issue_from_message(
+                target_message, channel, guild, "org/repo", "Core", "bug",
+            )
+
+        assert issue_number == 42
+        assert issue_url == "https://github.com/org/repo/issues/42"
+        mock_github_repo.create_issue.assert_called_once()
+        call_kwargs = mock_github_repo.create_issue.call_args[1]
+        assert call_kwargs["labels"] == ["bug"]
+
+    @pytest.mark.asyncio
+    async def test_creates_issue_without_label(self):
+        """Should create issue with no labels when label is None."""
+        import discord
+
+        from bot import create_issue_from_message
+
+        target_message = MagicMock(spec=discord.Message)
+        target_message.author.id = 123
+        target_message.author.display_name = "TestUser"
+        target_message.author.name = "testuser"
+        target_message.content = "General question"
+        target_message.created_at.strftime.return_value = "2024-01-01 00:00 UTC"
+        target_message.attachments = []
+        target_message.id = 999
+
+        async def empty_history():
+            return
+            yield
+
+        channel = MagicMock()
+        channel.id = 456
+        channel.name = "support"
+        channel.guild.name = "Test Server"
+        channel.history = MagicMock(return_value=empty_history())
+
+        guild = MagicMock(spec=discord.Guild)
+        guild.id = 789
+
+        mock_openai = AsyncMock()
+        mock_openai.chat.completions.create = AsyncMock(
+            return_value=MagicMock(
+                choices=[MagicMock(message=MagicMock(content="General question"))]
+            )
+        )
+
+        mock_github_issue = MagicMock()
+        mock_github_issue.number = 10
+        mock_github_issue.html_url = "https://github.com/org/repo/issues/10"
+        mock_github_repo = MagicMock()
+        mock_github_repo.get_labels.return_value = []
+        mock_github_repo.create_issue.return_value = mock_github_issue
+        mock_github = MagicMock()
+        mock_github.get_repo.return_value = mock_github_repo
+
+        with (
+            patch("bot.openai_client", mock_openai),
+            patch("bot.github_client", mock_github),
+            patch("bot.bot") as mock_bot,
+        ):
+            mock_bot.http_session = AsyncMock()
+            issue_number, issue_url = await create_issue_from_message(
+                target_message, channel, guild, "org/repo", "Core", None,
+            )
+
+        assert issue_number == 10
+        mock_github_repo.create_issue.assert_called_once()
+        call_kwargs = mock_github_repo.create_issue.call_args[1]
+        # No label passed, so create_issue called without labels kwarg
+        assert "labels" not in call_kwargs
+
+
+class TestCreateIssueModal:
+    """Tests for the CreateIssueModal class."""
+
+    @pytest.mark.asyncio
+    async def test_modal_has_project_options_from_config(self):
+        """Modal project select should have options matching PROJECTS config."""
+        from bot import CreateIssueModal
+
+        target_message = MagicMock()
+        modal = CreateIssueModal(target_message=target_message)
+
+        project_labels = [opt.label for opt in modal.project.options]
+        assert len(project_labels) > 0
+        # Options should match what's in PROJECTS config
+        from bot import PROJECTS
+
+        expected_names = [name for _, (_, name) in PROJECTS.items()]
+        assert project_labels == expected_names
+
+    @pytest.mark.asyncio
+    async def test_modal_has_issue_type_options_from_config(self):
+        """Modal issue type select should have options matching ISSUE_TYPES config."""
+        from bot import CreateIssueModal
+
+        target_message = MagicMock()
+        modal = CreateIssueModal(target_message=target_message)
+
+        type_labels = [opt.label for opt in modal.issue_type.options]
+        assert len(type_labels) > 0
+        # Should have readable display names, not raw labels
+        assert "General Issue" in type_labels or all(
+            label[0].isupper() for label in type_labels
+        )
+
+    @pytest.mark.asyncio
+    async def test_modal_stores_target_message(self):
+        """Modal should store the target message reference."""
+        from bot import CreateIssueModal
+
+        target_message = MagicMock()
+        modal = CreateIssueModal(target_message=target_message)
+        assert modal.target_message is target_message
+
+    @pytest.mark.asyncio
+    async def test_on_submit_creates_issue(self):
+        """on_submit should defer, create issue, and send followup."""
+        import discord
+
+        from bot import PROJECTS, CreateIssueModal
+
+        async def empty_history():
+            return
+            yield
+
+        target_message = AsyncMock(spec=discord.Message)
+        target_message.channel = MagicMock()
+        target_message.channel.id = 456
+        target_message.channel.name = "support"
+        target_message.channel.guild.name = "Test Server"
+        target_message.channel.history = MagicMock(return_value=empty_history())
+        target_message.guild = MagicMock(spec=discord.Guild)
+        target_message.guild.id = 789
+        target_message.author.id = 123
+        target_message.author.display_name = "TestUser"
+        target_message.author.name = "testuser"
+        target_message.content = "Bug report"
+        target_message.created_at.strftime.return_value = "2024-01-01 00:00 UTC"
+        target_message.attachments = []
+        target_message.id = 999
+
+        modal = CreateIssueModal(target_message=target_message)
+
+        # Simulate selection values
+        first_repo = list(PROJECTS.values())[0][0]
+        modal.project._values = [first_repo]
+        modal.issue_type._values = ["bug"]
+
+        interaction = AsyncMock()
+
+        mock_openai = AsyncMock()
+        mock_openai.chat.completions.create = AsyncMock(
+            return_value=MagicMock(
+                choices=[MagicMock(message=MagicMock(content="Bug report title"))]
+            )
+        )
+
+        mock_github_issue = MagicMock()
+        mock_github_issue.number = 5
+        mock_github_issue.html_url = "https://github.com/org/repo/issues/5"
+        mock_github_repo = MagicMock()
+        label_bug = MagicMock()
+        label_bug.name = "bug"
+        mock_github_repo.get_labels.return_value = [label_bug]
+        mock_github_repo.create_issue.return_value = mock_github_issue
+        mock_github = MagicMock()
+        mock_github.get_repo.return_value = mock_github_repo
+
+        with (
+            patch("bot.openai_client", mock_openai),
+            patch("bot.github_client", mock_github),
+            patch("bot.bot") as mock_bot,
+        ):
+            mock_bot.http_session = AsyncMock()
+            await modal.on_submit(interaction)
+
+        interaction.response.defer.assert_called_once_with(
+            ephemeral=True, thinking=True
+        )
+        interaction.followup.send.assert_called_once()
+        followup_kwargs = interaction.followup.send.call_args
+        assert "issue #5" in followup_kwargs[0][0]
+        assert followup_kwargs[1]["ephemeral"] is True
+        target_message.reply.assert_called_once()
+        target_message.add_reaction.assert_called_once_with("✅")
+
+    @pytest.mark.asyncio
+    async def test_on_submit_none_label_conversion(self):
+        """on_submit should convert __none__ sentinel back to None."""
+        import discord
+
+        from bot import PROJECTS, CreateIssueModal
+
+        async def empty_history():
+            return
+            yield
+
+        target_message = AsyncMock(spec=discord.Message)
+        target_message.channel = MagicMock()
+        target_message.channel.id = 456
+        target_message.channel.name = "support"
+        target_message.channel.guild.name = "Test Server"
+        target_message.channel.history = MagicMock(return_value=empty_history())
+        target_message.guild = MagicMock(spec=discord.Guild)
+        target_message.guild.id = 789
+        target_message.author.id = 123
+        target_message.author.display_name = "TestUser"
+        target_message.author.name = "testuser"
+        target_message.content = "General question"
+        target_message.created_at.strftime.return_value = "2024-01-01 00:00 UTC"
+        target_message.attachments = []
+        target_message.id = 999
+
+        modal = CreateIssueModal(target_message=target_message)
+
+        first_repo = list(PROJECTS.values())[0][0]
+        modal.project._values = [first_repo]
+        modal.issue_type._values = ["__none__"]
+
+        interaction = AsyncMock()
+
+        mock_openai = AsyncMock()
+        mock_openai.chat.completions.create = AsyncMock(
+            return_value=MagicMock(
+                choices=[MagicMock(message=MagicMock(content="General title"))]
+            )
+        )
+
+        mock_github_issue = MagicMock()
+        mock_github_issue.number = 6
+        mock_github_issue.html_url = "https://github.com/org/repo/issues/6"
+        mock_github_repo = MagicMock()
+        mock_github_repo.get_labels.return_value = []
+        mock_github_repo.create_issue.return_value = mock_github_issue
+        mock_github = MagicMock()
+        mock_github.get_repo.return_value = mock_github_repo
+
+        with (
+            patch("bot.openai_client", mock_openai),
+            patch("bot.github_client", mock_github),
+            patch("bot.bot") as mock_bot,
+        ):
+            mock_bot.http_session = AsyncMock()
+            await modal.on_submit(interaction)
+
+        # Issue should be created without labels (no label for __none__)
+        mock_github_repo.create_issue.assert_called_once()
+        call_kwargs = mock_github_repo.create_issue.call_args[1]
+        assert "labels" not in call_kwargs
+
+
+class TestCreateIssueContextMenu:
+    """Tests for the Create Issue context menu callback."""
+
+    @pytest.mark.asyncio
+    async def test_unauthorized_user_rejected(self, mock_role):
+        """Unauthorized user should get an ephemeral rejection."""
+        import discord
+
+        from bot import create_issue_callback
+
+        member = MagicMock(spec=discord.Member)
+        member.roles = [mock_role(11111)]
+
+        interaction = AsyncMock()
+        interaction.user = member
+        message = AsyncMock()
+
+        with patch("bot.AUTHORIZED_ROLE_ID", 99999):
+            await create_issue_callback(interaction, message)
+
+        interaction.response.send_message.assert_called_once_with(
+            "You don't have permission to use this.", ephemeral=True
+        )
+        interaction.response.send_modal.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_authorized_user_gets_modal(self, mock_role):
+        """Authorized user should get a modal sent."""
+        import discord
+
+        from bot import CreateIssueModal, create_issue_callback
+
+        member = MagicMock(spec=discord.Member)
+        member.roles = [mock_role(99999)]
+
+        interaction = AsyncMock()
+        interaction.user = member
+
+        message = AsyncMock(spec=discord.Message)
+
+        with patch("bot.AUTHORIZED_ROLE_ID", 99999):
+            await create_issue_callback(interaction, message)
+
+        interaction.response.send_modal.assert_called_once()
+        sent_modal = interaction.response.send_modal.call_args[0][0]
+        assert isinstance(sent_modal, CreateIssueModal)
+        assert sent_modal.target_message is message
+
+
 class TestGuildHandling:
     """Tests for guild-related edge cases."""
 

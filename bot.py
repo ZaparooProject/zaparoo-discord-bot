@@ -173,6 +173,85 @@ def make_support_callback(response_config: dict):
     return callback
 
 
+class CreateIssueModal(discord.ui.Modal, title="Create Issue"):
+    """Modal with project and issue type selects for creating GitHub issues."""
+
+    project = discord.ui.Select(
+        placeholder="Select a project...",
+        options=[
+            discord.SelectOption(label=name, value=repo, emoji=emoji)
+            for emoji, (repo, name) in PROJECTS.items()
+        ],
+        row=0,
+    )
+    issue_type = discord.ui.Select(
+        placeholder="Select issue type...",
+        options=[
+            discord.SelectOption(
+                label=label.replace("-", " ").title() if label else "General Issue",
+                value=label if label else "__none__",
+                emoji=emoji,
+            )
+            for emoji, label in ISSUE_TYPES.items()
+        ],
+        row=1,
+    )
+
+    def __init__(self, target_message: discord.Message):
+        super().__init__()
+        self.target_message = target_message
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+
+        repo_name = self.project.values[0]
+        project_name = next(n for _, (r, n) in PROJECTS.items() if r == repo_name)
+        label = self.issue_type.values[0]
+        if label == "__none__":
+            label = None
+
+        channel = self.target_message.channel
+        guild = self.target_message.guild
+
+        try:
+            issue_number, issue_url = await create_issue_from_message(
+                self.target_message, channel, guild, repo_name, project_name, label,
+            )
+            await interaction.followup.send(
+                f"Created {project_name} issue #{issue_number}: <{issue_url}>",
+                ephemeral=True,
+            )
+            await self.target_message.reply(
+                f"Created {project_name} issue #{issue_number}: <{issue_url}>",
+                mention_author=False,
+            )
+            await self.target_message.add_reaction("✅")
+        except Exception:
+            logging.exception("Failed to create issue via context menu")
+            try:
+                await interaction.followup.send(
+                    "Failed to create issue. Check bot logs for details.",
+                    ephemeral=True,
+                )
+            except Exception:
+                pass
+
+
+async def create_issue_callback(
+    interaction: discord.Interaction, message: discord.Message
+):
+    """Context menu callback for the Create Issue command."""
+    if not isinstance(interaction.user, discord.Member) or not has_authorized_role(
+        interaction.user
+    ):
+        await interaction.response.send_message(
+            "You don't have permission to use this.", ephemeral=True
+        )
+        return
+    modal = CreateIssueModal(target_message=message)
+    await interaction.response.send_modal(modal)
+
+
 class IssueBot(commands.Bot):
     def __init__(self):
         super().__init__(command_prefix="!", intents=intents, help_command=None)
@@ -186,6 +265,11 @@ class IssueBot(commands.Bot):
             callback = make_support_callback(response_config)
             cmd = discord.app_commands.ContextMenu(name=name, callback=callback)
             self.tree.add_command(cmd)
+
+        cmd = discord.app_commands.ContextMenu(
+            name="Create Issue", callback=create_issue_callback
+        )
+        self.tree.add_command(cmd)
 
     async def close(self):
         if self.http_session:
@@ -317,6 +401,118 @@ def create_github_issue(
     return issue.number, issue.html_url
 
 
+async def create_issue_from_message(
+    target_message: discord.Message,
+    channel: discord.abc.Messageable,
+    guild: discord.Guild,
+    repo_name: str,
+    project_name: str,
+    label: str | None,
+) -> tuple[int, str]:
+    """Gather context, build issue body, generate title, and create a GitHub issue.
+
+    Returns (issue_number, issue_url). Raises on failure.
+    """
+    # Fetch context messages (only from target author or users with authorized role)
+    target_author_id = target_message.author.id
+    context_messages = []
+    try:
+        async for msg in channel.history(limit=10, before=target_message):
+            msg_member = guild.get_member(msg.author.id)
+            if msg.author.id == target_author_id or (
+                msg_member and has_authorized_role(msg_member)
+            ):
+                context_messages.append(msg)
+                if len(context_messages) >= CONTEXT_MESSAGES:
+                    break
+        context_messages.reverse()
+    except Exception:
+        logging.exception("Could not fetch context")
+
+    # Process attachments
+    attachment_urls = []
+    for msg in context_messages + [target_message]:
+        for attachment in msg.attachments:
+            ext = Path(attachment.filename).suffix.lower()
+            if ext in ALLOWED_FILE_EXTENSIONS:
+                if attachment.size > MAX_ATTACHMENT_SIZE:
+                    logging.warning(
+                        f"Skipping large attachment: {attachment.filename}"
+                        f" ({attachment.size} bytes)"
+                    )
+                    continue
+                data, filename = await download_attachment(bot.http_session, attachment.url)
+                if data:
+                    local_url = await save_file_locally(data, filename)
+                    if local_url:
+                        attachment_urls.append((attachment.filename, local_url))
+                        continue
+                # Fallback to Discord URL if download or save failed
+                attachment_urls.append((attachment.filename, attachment.url))
+
+    # Build issue body
+    guild_name = guild.name
+    discord_url = (
+        f"https://discord.com/channels/{guild.id}/{channel.id}/{target_message.id}"
+    )
+
+    if isinstance(channel, discord.Thread):
+        parent_name = channel.parent.name if channel.parent else "unknown"
+        channel_display = f"#{parent_name} → {channel.name}"
+    else:
+        channel_display = f"#{channel.name}" if hasattr(channel, "name") else "Direct Message"
+
+    body_parts = [
+        "*Issue created from Discord*",
+        "",
+        f"**Source:** [{guild_name} / {channel_display}]({discord_url})",
+        "",
+        "---",
+        "",
+    ]
+
+    body_parts.append("### Reported Message")
+    body_parts.append("")
+    body_parts.append(format_message_for_issue(target_message, is_target=True))
+    body_parts.append("")
+
+    if context_messages:
+        body_parts.append("### Context (previous messages)")
+        body_parts.append("")
+        for msg in context_messages:
+            body_parts.append(format_message_for_issue(msg))
+            body_parts.append("")
+
+    if attachment_urls:
+        body_parts.append("### Attachments")
+        body_parts.append("")
+        for filename, url in attachment_urls:
+            ext = Path(filename).suffix.lower()
+            if ext in IMAGE_EXTENSIONS:
+                body_parts.append(f"![{filename}]({url})")
+            else:
+                body_parts.append(f"[{filename}]({url})")
+        body_parts.append("")
+
+    body = "\n".join(body_parts)
+
+    # Generate issue title using LLM
+    title = await generate_issue_title(body)
+
+    # Build labels
+    labels = []
+    if label:
+        labels.append(label)
+
+    # Create issue
+    issue_number, issue_url = await asyncio.to_thread(
+        create_github_issue, repo_name, title, body, labels
+    )
+
+    logging.info(f"Created {project_name} issue #{issue_number}: {title}")
+    return issue_number, issue_url
+
+
 def cleanup_pending():
     """Remove expired pending project selections."""
     now = time.monotonic()
@@ -404,114 +600,17 @@ async def process_reaction(payload: discord.RawReactionActionEvent):
     except Exception:
         pass
 
-    # Fetch context messages (only from target author or users with authorized role)
-    target_author_id = target_message.author.id
-    context_messages = []
+    # Create issue using shared logic
     try:
-        async for msg in channel.history(limit=10, before=target_message):
-            # Check if message author is target author or has authorized role
-            msg_member = guild.get_member(msg.author.id)
-            if msg.author.id == target_author_id or (
-                msg_member and has_authorized_role(msg_member)
-            ):
-                context_messages.append(msg)
-                if len(context_messages) >= CONTEXT_MESSAGES:
-                    break
-        context_messages.reverse()
-    except Exception:
-        logging.exception("Could not fetch context")
-
-    # Process attachments
-    attachment_urls = []
-
-    for msg in context_messages + [target_message]:
-        for attachment in msg.attachments:
-            ext = Path(attachment.filename).suffix.lower()
-            if ext in ALLOWED_FILE_EXTENSIONS:
-                if attachment.size > MAX_ATTACHMENT_SIZE:
-                    logging.warning(
-                        f"Skipping large attachment: {attachment.filename}"
-                        f" ({attachment.size} bytes)"
-                    )
-                    continue
-                data, filename = await download_attachment(bot.http_session, attachment.url)
-                if data:
-                    local_url = await save_file_locally(data, filename)
-                    if local_url:
-                        attachment_urls.append((attachment.filename, local_url))
-                        continue
-                # Fallback to Discord URL if download or save failed
-                attachment_urls.append((attachment.filename, attachment.url))
-
-    # Build issue body
-    guild_name = channel.guild.name if hasattr(channel, "guild") else "DM"
-    discord_url = (
-        f"https://discord.com/channels/{payload.guild_id}/{payload.channel_id}/{payload.message_id}"
-    )
-
-    # Handle threads - show parent channel context
-    if isinstance(channel, discord.Thread):
-        parent_name = channel.parent.name if channel.parent else "unknown"
-        channel_display = f"#{parent_name} → {channel.name}"
-    else:
-        channel_display = f"#{channel.name}" if hasattr(channel, "name") else "Direct Message"
-
-    body_parts = [
-        "*Issue created from Discord*",
-        "",
-        f"**Source:** [{guild_name} / {channel_display}]({discord_url})",
-        "",
-        "---",
-        "",
-    ]
-
-    body_parts.append("### Reported Message")
-    body_parts.append("")
-    body_parts.append(format_message_for_issue(target_message, is_target=True))
-    body_parts.append("")
-
-    if context_messages:
-        body_parts.append("### Context (previous messages)")
-        body_parts.append("")
-        for msg in context_messages:
-            body_parts.append(format_message_for_issue(msg))
-            body_parts.append("")
-
-    if attachment_urls:
-        body_parts.append("### Attachments")
-        body_parts.append("")
-        for filename, url in attachment_urls:
-            ext = Path(filename).suffix.lower()
-            if ext in IMAGE_EXTENSIONS:
-                body_parts.append(f"![{filename}]({url})")
-            else:
-                body_parts.append(f"[{filename}]({url})")
-        body_parts.append("")
-
-    body = "\n".join(body_parts)
-
-    # Generate issue title using LLM
-    title = await generate_issue_title(body)
-
-    # Build labels
-    labels = []
-    if label:
-        labels.append(label)
-
-    # Create issue
-    try:
-        issue_number, issue_url = await asyncio.to_thread(
-            create_github_issue, repo_name, title, body, labels
+        issue_number, issue_url = await create_issue_from_message(
+            target_message, channel, guild, repo_name, project_name, label,
         )
 
         await target_message.reply(
             f"Created {project_name} issue #{issue_number}: <{issue_url}>",
             mention_author=False,
         )
-
         await target_message.add_reaction("✅")
-
-        logging.info(f"Created {project_name} issue #{issue_number}: {title}")
 
     except Exception:
         logging.exception("Failed to create issue")
@@ -528,10 +627,11 @@ async def process_reaction(payload: discord.RawReactionActionEvent):
 
 @bot.event
 async def on_ready():
-    if SUPPORT_RESPONSES and not bot._tree_synced:
+    if not bot._tree_synced:
         await bot.tree.sync()
         bot._tree_synced = True
-        logging.info(f"Synced {len(SUPPORT_RESPONSES)} support response command(s)")
+        cmd_count = len(SUPPORT_RESPONSES) + 1
+        logging.info(f"Synced {cmd_count} context menu command(s)")
     logging.info(f"Logged in as {bot.user} (ID: {bot.user.id})")
     logging.info(f"Authorized role ID: {AUTHORIZED_ROLE_ID}")
     logging.info(f"Images: {IMAGES_DIR.absolute()} -> {IMAGES_URL}")
@@ -601,8 +701,8 @@ if __name__ == "__main__":
     if not PROJECTS:
         print("Error: No projects configured")
         exit(1)
-    if len(SUPPORT_RESPONSES) > 5:
-        print("Error: Max 5 support responses allowed (Discord limit)")
+    if len(SUPPORT_RESPONSES) > 4:
+        print("Error: Max 4 support responses allowed (1 slot reserved for Create Issue)")
         exit(1)
 
     init()

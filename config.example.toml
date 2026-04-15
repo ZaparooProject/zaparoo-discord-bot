@@ -48,7 +48,7 @@ images_url = "https://your-server.com/discord-files"
 
 # Support responses - right-click context menu commands that reply with an
 # embed and URL buttons. Each [[support_responses]] entry becomes a separate
-# command in the Apps menu. Max 5 entries (Discord limit).
+# command in the Apps menu. Max 4 entries (Create Issue uses 1 of 5 Discord slots).
 #
 # [[support_responses]]
 # name = "Request Logs"
