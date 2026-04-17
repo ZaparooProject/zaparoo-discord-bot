@@ -107,37 +107,29 @@ class SupportResponse(TypedDict, total=False):
 
 SUPPORT_RESPONSES: list[SupportResponse] = [
     {
-        "name": "Request Logs",
-        "title": "📋 Log File Needed",
+        "name": "Request Troubleshooting",
+        "title": "Troubleshooting Info Needed",
         "message": (
-            "To help troubleshoot, please send us your log file:\n"
+            "To help us investigate, please send a log file.\n"
             "\n"
-            "1. Open the **Zaparoo App** or **TUI**\n"
-            "2. Go to **Settings > Advanced > View logs**\n"
-            "3. Tap **Upload** to get a shareable link\n"
-            "4. Paste the link here"
+            "**In the App**: go to **Settings > Advanced > View logs** "
+            "and tap **Upload** for a shareable link.\n"
+            "\n"
+            "**In the TUI**: go to **Settings > Logs** and select "
+            "**Upload** for a shareable link.\n"
+            "\n"
+            "Paste the link here.\n"
+            "\n"
+            "**On MiSTer**: logs are wiped on power-off. Collect them "
+            "before shutting down.\n"
+            "\n"
+            "If you can trigger the issue on demand, enable "
+            "**Settings > Advanced > Debug Logging** first, reproduce it, "
+            "then collect the log. This gives us much more detail."
         ),
         "buttons": [
-            {"label": "📄 Log Guide", "url": "https://zaparoo.org/support/#collecting-logs"},
-            {"label": "Full Support Page", "url": "https://zaparoo.org/support/"},
-        ],
-    },
-    {
-        "name": "Enable Debug Mode",
-        "title": "🔍 Debug Logging Needed",
-        "message": (
-            "Please enable debug logging and reproduce the issue:\n"
-            "\n"
-            "1. Open the **Zaparoo App** or **TUI**\n"
-            "2. Go to **Settings > Advanced**\n"
-            "3. Enable **Debug Logging**\n"
-            "4. Reproduce the issue\n"
-            "5. Upload the log file (**Settings > Advanced > View logs > Upload**)\n"
-            "6. Paste the shareable link here"
-        ),
-        "buttons": [
-            {"label": "🔍 Debug Guide", "url": "https://zaparoo.org/support/#debug-logging"},
-            {"label": "📄 Log Guide", "url": "https://zaparoo.org/support/#collecting-logs"},
+            {"label": "Docs", "url": "https://zaparoo.org/docs/"},
+            {"label": "Known Issues", "url": "https://github.com/ZaparooProject/zaparoo-core/issues"},
         ],
     },
 ]
