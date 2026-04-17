@@ -53,10 +53,10 @@ GITHUB_APP_PRIVATE_KEY_PATH = os.getenv("GITHUB_APP_PRIVATE_KEY_PATH")
 _app_install = os.getenv("GITHUB_APP_INSTALLATION_ID")
 GITHUB_APP_INSTALLATION_ID = int(_app_install) if _app_install else None
 IMAGES_URL = os.getenv("IMAGES_URL", "")
+IMAGES_DIR = Path(os.getenv("IMAGES_DIR", "./images"))
 
 # Hardcoded config
 GEMINI_MODEL = "gemini-2.5-flash"
-IMAGES_DIR = Path("./images")
 MAX_ATTACHMENT_SIZE = 10_485_760
 CONTEXT_MESSAGES = 5
 CONTEXT_GAP_SECONDS = 600
