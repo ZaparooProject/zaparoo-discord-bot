@@ -574,7 +574,7 @@ requires-dist = [
     { name = "aiohttp", specifier = ">=3.9.0" },
     { name = "aioresponses", marker = "extra == 'test'", specifier = ">=0.7.0" },
     { name = "discord-py", specifier = ">=2.3.0" },
-    { name = "dpytest", marker = "extra == 'test'", git = "https://github.com/CraftSpider/dpytest.git" },
+    { name = "dpytest", marker = "extra == 'test'", git = "https://github.com/CraftSpider/dpytest.git?rev=e443a7c3447c35527a975dfcc3cde76068e15227" },
     { name = "google-genai", specifier = ">=1.73.1" },
     { name = "pygithub", specifier = ">=2.1.0" },
     { name = "pytest", marker = "extra == 'test'", specifier = ">=8.0.0" },
@@ -610,7 +610,7 @@ wheels = [
 [[package]]
 name = "dpytest"
 version = "0.7.0"
-source = { git = "https://github.com/CraftSpider/dpytest.git#e443a7c3447c35527a975dfcc3cde76068e15227" }
+source = { git = "https://github.com/CraftSpider/dpytest.git?rev=e443a7c3447c35527a975dfcc3cde76068e15227#e443a7c3447c35527a975dfcc3cde76068e15227" }
 dependencies = [
     { name = "discord-py" },
     { name = "pytest" },

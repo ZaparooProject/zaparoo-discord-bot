@@ -162,9 +162,7 @@ class TestContextFiltering:
     """Tests for context message filtering."""
 
     @pytest.mark.asyncio
-    async def test_context_gathering_with_history(
-        self, bot_instance, mock_github, mock_gemini
-    ):
+    async def test_context_gathering_with_history(self, bot_instance, mock_github, mock_gemini):
         """Context gathering should fetch channel history for issue body."""
 
         guild = dpytest.get_config().guilds[0]
@@ -294,10 +292,16 @@ class TestAttachmentFlow:
 
         from bot import download_attachment, save_file_locally
 
-        # Test download_attachment with mocked session
+        # Test download_attachment with mocked session that supports iter_chunked
+        body = b"fake image data"
+
+        async def fake_iter_chunked(size):
+            yield body
+
         mock_response = MagicMock()
         mock_response.status = 200
-        mock_response.read = AsyncMock(return_value=b"fake image data")
+        mock_response.headers = {}
+        mock_response.content.iter_chunked = fake_iter_chunked
 
         mock_session = MagicMock()
         mock_session.get = MagicMock(
@@ -307,9 +311,10 @@ class TestAttachmentFlow:
             )
         )
 
-        data, filename = await download_attachment(
-            mock_session, "https://cdn.discord.com/attachments/123/456/screenshot.png"
-        )
+        with patch("bot.MAX_ATTACHMENT_SIZE", 10 * 1024 * 1024):
+            data, filename = await download_attachment(
+                mock_session, "https://cdn.discord.com/attachments/123/456/screenshot.png"
+            )
 
         assert data == b"fake image data"
         assert filename == "screenshot.png"
@@ -332,12 +337,9 @@ class TestAttachmentFlow:
             assert files[0].read_bytes() == b"fake image data"
 
     @pytest.mark.asyncio
-    async def test_fallback_to_discord_url_on_save_failure(self, mock_github, mock_gemini):
-        """When save_file_locally fails, should fall back to Discord URL."""
+    async def test_fail_note_on_save_failure(self, mock_github, mock_gemini):
+        """When save_file_locally fails, issue body should contain a fail note (not Discord URL)."""
         from bot import process_reaction
-
-        # This tests the fallback path in bot.py lines 358-359
-        # When download succeeds but save returns None, use original URL
 
         mock_attachment = MagicMock()
         mock_attachment.filename = "test.png"
@@ -400,10 +402,11 @@ class TestAttachmentFlow:
 
             await process_reaction(mock_payload)
 
-            # Verify issue was created with Discord URL as fallback
+            # Verify issue was created with a fail note (no expiring Discord URL)
             mock_repo = mock_github.get_repo.return_value
             call_kwargs = mock_repo.create_issue.call_args.kwargs
-            assert "https://cdn.discord.com/original.png" in call_kwargs["body"]
+            assert "*[attachment failed to download: test.png]*" in call_kwargs["body"]
+            assert "cdn.discord.com" not in call_kwargs["body"]
 
 
 class TestProjectSelection:

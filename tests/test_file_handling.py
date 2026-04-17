@@ -1,6 +1,6 @@
 """Tests for file handling, extension validation, and security measures."""
 
-from unittest.mock import patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -269,3 +269,117 @@ class TestDownloadAttachment:
 
                 assert data is None
                 assert filename == ""
+
+    @pytest.mark.asyncio
+    async def test_rejects_large_content_length(self):
+        """Content-Length exceeding max should return None without reading body."""
+        from unittest.mock import patch
+
+        import aiohttp
+        from aioresponses import aioresponses
+
+        from bot import download_attachment
+
+        async with aiohttp.ClientSession() as session:
+            with aioresponses() as mocked, patch("bot.MAX_ATTACHMENT_SIZE", 100):
+                mocked.get(
+                    "https://cdn.discord.com/attachments/123/456/big.png",
+                    body=b"x" * 50,  # body is small but header says it's huge
+                    status=200,
+                    headers={"Content-Length": "999"},
+                )
+
+                data, filename = await download_attachment(
+                    session, "https://cdn.discord.com/attachments/123/456/big.png"
+                )
+
+                assert data is None
+
+    @pytest.mark.asyncio
+    async def test_rejects_body_exceeding_limit_during_stream(self):
+        """Body that grows past limit during streaming should return None."""
+        from unittest.mock import patch
+
+        import aiohttp
+        from aioresponses import aioresponses
+
+        from bot import download_attachment
+
+        async with aiohttp.ClientSession() as session:
+            with aioresponses() as mocked, patch("bot.MAX_ATTACHMENT_SIZE", 10):
+                mocked.get(
+                    "https://cdn.discord.com/attachments/123/456/big.png",
+                    body=b"x" * 100,
+                    status=200,
+                )
+
+                data, filename = await download_attachment(
+                    session, "https://cdn.discord.com/attachments/123/456/big.png"
+                )
+
+                assert data is None
+
+
+class TestAttachmentNotes:
+    """Tests for attachment omit/fail notes in issue body and followup comments."""
+
+    @pytest.mark.asyncio
+    async def test_disallowed_extension_produces_omit_note(self, temp_images_dir):
+        """Disallowed attachment should appear as an omit note, not a URL."""
+        from bot import build_followup_comment
+
+        attachment = MagicMock()
+        attachment.filename = "shell.php"
+        attachment.size = 100
+        attachment.url = "https://cdn.discord.com/attachments/1/2/shell.php"
+
+        message = MagicMock()
+        message.content = "Here is my attachment"
+        message.author.display_name = "User"
+        message.author.name = "user"
+        from datetime import UTC, datetime
+
+        message.created_at = datetime(2024, 1, 1, 12, 0, 0, tzinfo=UTC)
+        message.attachments = [attachment]
+
+        with (
+            patch("bot.ALLOWED_FILE_EXTENSIONS", _ALLOWED_EXTS),
+            patch("bot.MAX_ATTACHMENT_SIZE", 10 * 1024 * 1024),
+            patch("bot.bot") as mock_bot,
+        ):
+            mock_bot.http_session = MagicMock()
+            result = await build_followup_comment(message)
+
+        assert "*[attachment omitted: shell.php]*" in result
+        assert "cdn.discord.com" not in result
+
+    @pytest.mark.asyncio
+    async def test_failed_download_produces_fail_note(self, temp_images_dir):
+        """Attachment that fails to download should appear as a fail note."""
+        from bot import build_followup_comment
+
+        attachment = MagicMock()
+        attachment.filename = "screenshot.png"
+        attachment.size = 100
+        attachment.url = "https://cdn.discord.com/attachments/1/2/screenshot.png"
+
+        message = MagicMock()
+        message.content = "See screenshot"
+        message.author.display_name = "User"
+        message.author.name = "user"
+        from datetime import UTC, datetime
+
+        message.created_at = datetime(2024, 1, 1, 12, 0, 0, tzinfo=UTC)
+        message.attachments = [attachment]
+
+        with (
+            patch("bot.ALLOWED_FILE_EXTENSIONS", _ALLOWED_EXTS),
+            patch("bot.MAX_ATTACHMENT_SIZE", 10 * 1024 * 1024),
+            patch("bot.download_attachment", AsyncMock(return_value=(None, ""))),
+            patch("bot.bot") as mock_bot,
+        ):
+            mock_bot.http_session = MagicMock()
+            result = await build_followup_comment(message)
+
+        assert "*[attachment failed to download: screenshot.png]*" in result
+        assert "cdn.discord.com" not in result

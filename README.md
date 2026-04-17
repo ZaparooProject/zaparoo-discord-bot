@@ -103,6 +103,16 @@ The bot saves downloaded attachments (images, .txt, .log files) locally. You nee
 ```nginx
 location /discord-files/ {
     alias /opt/discord-issue-bot/images/;
+    add_header X-Content-Type-Options nosniff always;
+    default_type application/octet-stream;
+    types {
+        image/png  png;
+        image/jpeg jpg jpeg;
+        image/gif  gif;
+        image/webp webp;
+        text/plain txt log;
+    }
+    autoindex off;
 }
 ```
 

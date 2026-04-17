@@ -1,4 +1,8 @@
 .env
+.env.*
+!.env.example
+*.pem
+*.key
 images/
 .ruff_cache/
 __pycache__/

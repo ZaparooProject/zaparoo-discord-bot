@@ -48,9 +48,7 @@ class TestGenerateIssueTitle:
         from bot import generate_issue_title
 
         mock_client = MagicMock()
-        mock_client.aio.models.generate_content = AsyncMock(
-            side_effect=Exception("API Error")
-        )
+        mock_client.aio.models.generate_content = AsyncMock(side_effect=Exception("API Error"))
 
         with patch("bot.gemini_client", mock_client):
             title = await generate_issue_title("Some issue body")
@@ -63,9 +61,7 @@ class TestGenerateIssueTitle:
         from bot import generate_issue_title
 
         mock_client = MagicMock()
-        mock_client.aio.models.generate_content = AsyncMock(
-            return_value=MagicMock(text="Title")
-        )
+        mock_client.aio.models.generate_content = AsyncMock(return_value=MagicMock(text="Title"))
 
         with patch("bot.gemini_client", mock_client), patch("bot.GEMINI_MODEL", "gemini-2.5-pro"):
             await generate_issue_title("Body")
@@ -599,7 +595,12 @@ class TestCreateIssueFromMessage:
         ):
             mock_bot.http_session = AsyncMock()
             issue_number, issue_url = await create_issue_from_message(
-                target_message, channel, guild, "org/repo", "Core", "bug",
+                target_message,
+                channel,
+                guild,
+                "org/repo",
+                "Core",
+                "bug",
             )
 
         assert issue_number == 42
@@ -658,7 +659,12 @@ class TestCreateIssueFromMessage:
         ):
             mock_bot.http_session = AsyncMock()
             issue_number, issue_url = await create_issue_from_message(
-                target_message, channel, guild, "org/repo", "Core", None,
+                target_message,
+                channel,
+                guild,
+                "org/repo",
+                "Core",
+                None,
             )
 
         assert issue_number == 10
@@ -698,9 +704,7 @@ class TestCreateIssueModal:
         type_labels = [opt.label for opt in modal.issue_type.options]
         assert len(type_labels) > 0
         # Should have readable display names, not raw labels
-        assert "General Issue" in type_labels or all(
-            label[0].isupper() for label in type_labels
-        )
+        assert "General Issue" in type_labels or all(label[0].isupper() for label in type_labels)
 
     @pytest.mark.asyncio
     async def test_modal_stores_target_message(self):
@@ -771,9 +775,7 @@ class TestCreateIssueModal:
             mock_bot.http_session = AsyncMock()
             await modal.on_submit(interaction)
 
-        interaction.response.defer.assert_called_once_with(
-            ephemeral=True, thinking=True
-        )
+        interaction.response.defer.assert_called_once_with(ephemeral=True, thinking=True)
         interaction.followup.send.assert_called_once()
         followup_kwargs = interaction.followup.send.call_args
         assert "issue #5" in followup_kwargs[0][0]
@@ -935,9 +937,7 @@ class TestDetectProject:
         from bot import detect_project
 
         mock_client = MagicMock()
-        mock_client.aio.models.generate_content = AsyncMock(
-            return_value=MagicMock(text="unknown")
-        )
+        mock_client.aio.models.generate_content = AsyncMock(return_value=MagicMock(text="unknown"))
 
         with patch("bot.gemini_client", mock_client):
             result = await detect_project("Some vague question")
@@ -950,9 +950,7 @@ class TestDetectProject:
         from bot import detect_project
 
         mock_client = MagicMock()
-        mock_client.aio.models.generate_content = AsyncMock(
-            side_effect=Exception("API Error")
-        )
+        mock_client.aio.models.generate_content = AsyncMock(side_effect=Exception("API Error"))
 
         with patch("bot.gemini_client", mock_client):
             result = await detect_project("Some message")
@@ -1023,14 +1021,14 @@ class TestFilterContextWithLlm:
         """Should return messages at the indices the LLM specifies."""
         from bot import filter_context_with_llm
 
-        msgs = [MagicMock(author=MagicMock(display_name=f"User{i}"), content=f"msg{i}")
-                for i in range(5)]
+        msgs = [
+            MagicMock(author=MagicMock(display_name=f"User{i}"), content=f"msg{i}")
+            for i in range(5)
+        ]
         target = MagicMock(author=MagicMock(display_name="Reporter"), content="bug report")
 
         mock_client = MagicMock()
-        mock_client.aio.models.generate_content = AsyncMock(
-            return_value=MagicMock(text="1,3")
-        )
+        mock_client.aio.models.generate_content = AsyncMock(return_value=MagicMock(text="1,3"))
 
         with patch("bot.gemini_client", mock_client):
             result = await filter_context_with_llm(target, msgs)
@@ -1046,9 +1044,7 @@ class TestFilterContextWithLlm:
         target = MagicMock(author=MagicMock(display_name="Reporter"), content="bug")
 
         mock_client = MagicMock()
-        mock_client.aio.models.generate_content = AsyncMock(
-            return_value=MagicMock(text="none")
-        )
+        mock_client.aio.models.generate_content = AsyncMock(return_value=MagicMock(text="none"))
 
         with patch("bot.gemini_client", mock_client):
             result = await filter_context_with_llm(target, msgs)
@@ -1060,14 +1056,14 @@ class TestFilterContextWithLlm:
         """Should fall back to first N candidates when response.text is None."""
         from bot import filter_context_with_llm
 
-        msgs = [MagicMock(author=MagicMock(display_name=f"User{i}"), content=f"msg{i}")
-                for i in range(10)]
+        msgs = [
+            MagicMock(author=MagicMock(display_name=f"User{i}"), content=f"msg{i}")
+            for i in range(10)
+        ]
         target = MagicMock(author=MagicMock(display_name="Reporter"), content="bug")
 
         mock_client = MagicMock()
-        mock_client.aio.models.generate_content = AsyncMock(
-            return_value=MagicMock(text=None)
-        )
+        mock_client.aio.models.generate_content = AsyncMock(return_value=MagicMock(text=None))
 
         with patch("bot.gemini_client", mock_client), patch("bot.CONTEXT_MESSAGES", 3):
             result = await filter_context_with_llm(target, msgs)

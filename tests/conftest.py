@@ -202,6 +202,20 @@ def temp_images_dir(tmp_path):
     return images_dir
 
 
+@pytest.fixture(autouse=True)
+def clear_bot_globals():
+    """Reset mutable module-level globals between tests to prevent state leakage."""
+    import bot
+
+    bot.pending_projects.clear()
+    bot.recent_issues.clear()
+    bot._user_issue_timestamps.clear()
+    yield
+    bot.pending_projects.clear()
+    bot.recent_issues.clear()
+    bot._user_issue_timestamps.clear()
+
+
 @pytest.fixture
 def patch_bot_config(temp_images_dir):
     """Patch bot configuration for testing."""

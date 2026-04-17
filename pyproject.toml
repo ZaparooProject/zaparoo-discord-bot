@@ -19,7 +19,7 @@ test = [
     "pytest-asyncio>=0.24.0",
     "pytest-cov>=4.0.0",
     "aioresponses>=0.7.0",
-    "dpytest @ git+https://github.com/CraftSpider/dpytest.git",
+    "dpytest @ git+https://github.com/CraftSpider/dpytest.git@e443a7c3447c35527a975dfcc3cde76068e15227",
 ]
 
 [tool.pytest.ini_options]

@@ -13,7 +13,7 @@
 Discord Issue Bot
 
 React to Discord messages with emoji to create GitHub issues.
-Only responds to reactions from the authorized user.
+Only responds to reactions from users with the authorized role.
 """
 
 import asyncio
@@ -61,6 +61,7 @@ MAX_ATTACHMENT_SIZE = 10_485_760
 CONTEXT_MESSAGES = 5
 CONTEXT_GAP_SECONDS = 600
 PENDING_TIMEOUT = 60
+ISSUE_RATE_LIMIT_SECONDS = 10
 
 PROJECTS = {
     "🖥️": ("ZaparooProject/zaparoo-core", "Core"),
@@ -148,6 +149,7 @@ IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
 # Pending project selections: message_id -> (project_repo, project_name, timestamp)
 pending_projects: dict[int, tuple[str, str, float]] = {}
 
+
 class RecentIssue(NamedTuple):
     bot_reply_msg_id: int
     repo_name: str
@@ -159,6 +161,9 @@ class RecentIssue(NamedTuple):
 # Track recently created issues for follow-up attachment (channel_id -> entries)
 recent_issues: dict[int, list[RecentIssue]] = {}
 RECENT_ISSUE_TTL = 86400  # 24 hours
+
+# Per-user issue creation timestamps for rate limiting
+_user_issue_timestamps: dict[int, float] = {}
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -236,6 +241,14 @@ class CreateIssueModal(discord.ui.Modal, title="Create Issue"):
         self.target_message = target_message
 
     async def on_submit(self, interaction: discord.Interaction):
+        remaining = _check_rate_limit(interaction.user.id)
+        if remaining is not None:
+            await interaction.response.send_message(
+                f"Rate-limited. Try again in {remaining:.0f}s.",
+                ephemeral=True,
+            )
+            return
+
         await interaction.response.defer(ephemeral=True, thinking=True)
 
         repo_name = self.project.values[0]
@@ -249,8 +262,14 @@ class CreateIssueModal(discord.ui.Modal, title="Create Issue"):
 
         try:
             issue_number, issue_url = await create_issue_from_message(
-                self.target_message, channel, guild, repo_name, project_name, label,
+                self.target_message,
+                channel,
+                guild,
+                repo_name,
+                project_name,
+                label,
             )
+            _record_issue_for_rate_limit(interaction.user.id)
             await interaction.followup.send(
                 f"Created {project_name} issue #{issue_number}: <{issue_url}>",
                 ephemeral=True,
@@ -262,7 +281,10 @@ class CreateIssueModal(discord.ui.Modal, title="Create Issue"):
             await self.target_message.add_reaction("✅")
 
             record_recent_issue(
-                channel.id, reply_msg.id, repo_name, issue_number,
+                channel.id,
+                reply_msg.id,
+                repo_name,
+                issue_number,
                 self.target_message.author.id,
             )
         except Exception:
@@ -276,9 +298,7 @@ class CreateIssueModal(discord.ui.Modal, title="Create Issue"):
                 pass
 
 
-async def create_issue_callback(
-    interaction: discord.Interaction, message: discord.Message
-):
+async def create_issue_callback(interaction: discord.Interaction, message: discord.Message):
     """Context menu callback for the Create Issue command."""
     if not isinstance(interaction.user, discord.Member) or not has_authorized_role(
         interaction.user
@@ -305,9 +325,7 @@ class IssueBot(commands.Bot):
             cmd = discord.app_commands.ContextMenu(name=name, callback=callback)
             self.tree.add_command(cmd)
 
-        cmd = discord.app_commands.ContextMenu(
-            name="Create Issue", callback=create_issue_callback
-        )
+        cmd = discord.app_commands.ContextMenu(name="Create Issue", callback=create_issue_callback)
         self.tree.add_command(cmd)
 
     async def close(self):
@@ -531,10 +549,28 @@ async def download_attachment(session: aiohttp.ClientSession, url: str) -> tuple
     """Download an attachment and return (data, filename)."""
     try:
         async with session.get(url) as response:
-            if response.status == 200:
-                data = await response.read()
-                filename = url.split("/")[-1].split("?")[0]
-                return data, filename
+            if response.status != 200:
+                return None, ""
+            try:
+                content_length = int(response.headers.get("Content-Length", 0))
+            except ValueError:
+                content_length = 0
+            if content_length > MAX_ATTACHMENT_SIZE:
+                logging.warning(
+                    f"Skipping attachment: Content-Length {content_length} exceeds limit"
+                )
+                return None, ""
+            chunks: list[bytes] = []
+            total = 0
+            async for chunk in response.content.iter_chunked(65536):
+                total += len(chunk)
+                if total > MAX_ATTACHMENT_SIZE:
+                    logging.warning(f"Attachment exceeded size limit during download: {url}")
+                    return None, ""
+                chunks.append(chunk)
+            data = b"".join(chunks)
+            filename = url.split("/")[-1].split("?")[0]
+            return data, filename
     except Exception:
         logging.exception("Failed to download attachment")
     return None, ""
@@ -560,19 +596,41 @@ async def save_file_locally(data: bytes, original_filename: str) -> str | None:
     return f"{IMAGES_URL.rstrip('/')}/{filename}"
 
 
-def _escape_markdown_filename(filename: str) -> str:
-    """Escape characters that could inject markdown in ![name](url) links."""
-    return filename.replace("[", r"\[").replace("]", r"\]").replace("(", r"\(").replace(")", r"\)")
+def _escape_markdown_text(text: str) -> str:
+    """Escape characters that could inject markdown in prose and link label contexts."""
+    return (
+        text.replace("\\", "\\\\")
+        .replace("`", "\\`")
+        .replace("*", "\\*")
+        .replace("_", "\\_")
+        .replace("[", "\\[")
+        .replace("]", "\\]")
+        .replace("(", "\\(")
+        .replace(")", "\\)")
+    )
 
 
-def format_message_for_issue(message: discord.Message, is_target: bool = False) -> str:
+_USER_MENTION_RE = re.compile(r"<@!?\d+>")
+_ROLE_MENTION_RE = re.compile(r"<@&\d+>")
+
+
+def _sanitize_mentions(text: str) -> str:
+    """Replace user/role Discord mentions with placeholders; keep channel mentions."""
+    text = _USER_MENTION_RE.sub("[user]", text)
+    return _ROLE_MENTION_RE.sub("[role]", text)
+
+
+def format_message_for_issue(
+    message: discord.Message, author_label: str, is_target: bool = False
+) -> str:
     """Format a Discord message for inclusion in GitHub issue."""
     prefix = "**>>> Target Message:**" if is_target else ""
 
     timestamp = message.created_at.strftime("%Y-%m-%d %H:%M UTC")
-    author = f"**{message.author.display_name}** (@{message.author.name})"
+    author = f"**{_escape_markdown_text(author_label)}**"
 
-    content = message.content or "*[no text content]*"
+    raw_content = message.content or "*[no text content]*"
+    content = _sanitize_mentions(raw_content)
 
     lines = [
         prefix,
@@ -614,28 +672,39 @@ def add_comment_to_issue(repo_name: str, issue_number: int, body: str) -> str:
 async def build_followup_comment(message: discord.Message) -> str:
     """Build a markdown comment from a follow-up Discord message, including attachments."""
     parts = ["*Follow-up from Discord*", ""]
-    parts.append(format_message_for_issue(message))
+    parts.append(format_message_for_issue(message, "Reporter"))
     parts.append("")
 
     attachment_urls = []
+    attachment_notes = []
     for attachment in message.attachments:
         ext = Path(attachment.filename).suffix.lower()
-        if ext in ALLOWED_FILE_EXTENSIONS:
-            if attachment.size > MAX_ATTACHMENT_SIZE:
+        if ext not in ALLOWED_FILE_EXTENSIONS:
+            attachment_notes.append(
+                f"*[attachment omitted: {_escape_markdown_text(attachment.filename)}]*"
+            )
+            continue
+        if attachment.size > MAX_ATTACHMENT_SIZE:
+            continue
+        data, filename = await download_attachment(bot.http_session, attachment.url)
+        if data:
+            local_url = await save_file_locally(data, filename)
+            if local_url:
+                attachment_urls.append((attachment.filename, local_url))
                 continue
-            data, filename = await download_attachment(bot.http_session, attachment.url)
-            if data:
-                local_url = await save_file_locally(data, filename)
-                if local_url:
-                    attachment_urls.append((attachment.filename, local_url))
-                    continue
-            attachment_urls.append((attachment.filename, attachment.url))
+        attachment_notes.append(
+            f"*[attachment failed to download: {_escape_markdown_text(attachment.filename)}]*"
+        )
+
+    if attachment_notes:
+        parts.extend(attachment_notes)
+        parts.append("")
 
     if attachment_urls:
         parts.append("### Attachments")
         parts.append("")
         for filename, url in attachment_urls:
-            safe_name = _escape_markdown_filename(filename)
+            safe_name = _escape_markdown_text(filename)
             ext = Path(filename).suffix.lower()
             if ext in IMAGE_EXTENSIONS:
                 parts.append(f"![{safe_name}]({url})")
@@ -647,16 +716,25 @@ async def build_followup_comment(message: discord.Message) -> str:
 
 
 def record_recent_issue(
-    channel_id: int, bot_reply_msg_id: int, repo_name: str,
-    issue_number: int, target_author_id: int,
+    channel_id: int,
+    bot_reply_msg_id: int,
+    repo_name: str,
+    issue_number: int,
+    target_author_id: int,
 ):
     """Record a recently created issue for follow-up attachment."""
     cleanup_pending()
     if channel_id not in recent_issues:
         recent_issues[channel_id] = []
-    recent_issues[channel_id].append(RecentIssue(
-        bot_reply_msg_id, repo_name, issue_number, target_author_id, time.monotonic(),
-    ))
+    recent_issues[channel_id].append(
+        RecentIssue(
+            bot_reply_msg_id,
+            repo_name,
+            issue_number,
+            target_author_id,
+            time.monotonic(),
+        )
+    )
 
 
 async def create_issue_from_message(
@@ -674,38 +752,54 @@ async def create_issue_from_message(
     # Gather relevant context using smart filtering
     context_messages = await gather_context(target_message, channel)
 
+    # Build anonymized author map: target becomes "Reporter", others "User A/B/C..."
+    author_map: dict[int, str] = {}
+    label_counter = 0
+    for msg in context_messages:
+        if msg.author.id not in author_map:
+            author_map[msg.author.id] = f"User {chr(ord('A') + min(label_counter, 25))}"
+            label_counter += 1
+    author_map[target_message.author.id] = "Reporter"
+
     # Process attachments
-    attachment_urls = []
+    attachment_urls: list[tuple[str, str]] = []
+    attachment_notes: list[str] = []
     for msg in context_messages + [target_message]:
         for attachment in msg.attachments:
             ext = Path(attachment.filename).suffix.lower()
-            if ext in ALLOWED_FILE_EXTENSIONS:
-                if attachment.size > MAX_ATTACHMENT_SIZE:
-                    logging.warning(
-                        f"Skipping large attachment: {attachment.filename}"
-                        f" ({attachment.size} bytes)"
-                    )
+            if ext not in ALLOWED_FILE_EXTENSIONS:
+                attachment_notes.append(
+                    f"*[attachment omitted: {_escape_markdown_text(attachment.filename)}]*"
+                )
+                continue
+            if attachment.size > MAX_ATTACHMENT_SIZE:
+                logging.warning(
+                    f"Skipping large attachment: {attachment.filename} ({attachment.size} bytes)"
+                )
+                continue
+            data, filename = await download_attachment(bot.http_session, attachment.url)
+            if data:
+                local_url = await save_file_locally(data, filename)
+                if local_url:
+                    attachment_urls.append((attachment.filename, local_url))
                     continue
-                data, filename = await download_attachment(bot.http_session, attachment.url)
-                if data:
-                    local_url = await save_file_locally(data, filename)
-                    if local_url:
-                        attachment_urls.append((attachment.filename, local_url))
-                        continue
-                # Fallback to Discord URL if download or save failed
-                attachment_urls.append((attachment.filename, attachment.url))
+            attachment_notes.append(
+                f"*[attachment failed to download: {_escape_markdown_text(attachment.filename)}]*"
+            )
 
     # Build issue body
-    guild_name = guild.name
-    discord_url = (
-        f"https://discord.com/channels/{guild.id}/{channel.id}/{target_message.id}"
-    )
+    guild_name = _escape_markdown_text(guild.name)
+    discord_url = f"https://discord.com/channels/{guild.id}/{channel.id}/{target_message.id}"
 
     if isinstance(channel, discord.Thread):
-        parent_name = channel.parent.name if channel.parent else "unknown"
-        channel_display = f"#{parent_name} → {channel.name}"
+        parent_name = _escape_markdown_text(channel.parent.name if channel.parent else "unknown")
+        channel_display = f"#{parent_name} → {_escape_markdown_text(channel.name)}"
     else:
-        channel_display = f"#{channel.name}" if hasattr(channel, "name") else "Direct Message"
+        channel_display = (
+            f"#{_escape_markdown_text(channel.name)}"
+            if hasattr(channel, "name")
+            else "Direct Message"
+        )
 
     body_parts = [
         "*Issue created from Discord*",
@@ -718,21 +812,25 @@ async def create_issue_from_message(
 
     body_parts.append("### Reported Message")
     body_parts.append("")
-    body_parts.append(format_message_for_issue(target_message, is_target=True))
+    body_parts.append(format_message_for_issue(target_message, "Reporter", is_target=True))
     body_parts.append("")
 
     if context_messages:
         body_parts.append("### Context (previous messages)")
         body_parts.append("")
         for msg in context_messages:
-            body_parts.append(format_message_for_issue(msg))
+            body_parts.append(format_message_for_issue(msg, author_map.get(msg.author.id, "User")))
             body_parts.append("")
+
+    if attachment_notes:
+        body_parts.extend(attachment_notes)
+        body_parts.append("")
 
     if attachment_urls:
         body_parts.append("### Attachments")
         body_parts.append("")
         for filename, url in attachment_urls:
-            safe_name = _escape_markdown_filename(filename)
+            safe_name = _escape_markdown_text(filename)
             ext = Path(filename).suffix.lower()
             if ext in IMAGE_EXTENSIONS:
                 body_parts.append(f"![{safe_name}]({url})")
@@ -760,7 +858,7 @@ async def create_issue_from_message(
 
 
 def cleanup_pending():
-    """Remove expired pending project selections and old recent issues."""
+    """Remove expired pending selections, old recent issues, and stale rate limit entries."""
     now = time.monotonic()
     expired = [
         msg_id
@@ -772,11 +870,32 @@ def cleanup_pending():
 
     for channel_id in list(recent_issues):
         recent_issues[channel_id] = [
-            entry for entry in recent_issues[channel_id]
+            entry
+            for entry in recent_issues[channel_id]
             if now - entry.timestamp <= RECENT_ISSUE_TTL
         ]
         if not recent_issues[channel_id]:
             del recent_issues[channel_id]
+
+    stale_users = [
+        uid for uid, ts in _user_issue_timestamps.items() if now - ts > ISSUE_RATE_LIMIT_SECONDS * 2
+    ]
+    for uid in stale_users:
+        del _user_issue_timestamps[uid]
+
+
+def _check_rate_limit(user_id: int) -> float | None:
+    """Return seconds remaining in cooldown if rate-limited, else None."""
+    last = _user_issue_timestamps.get(user_id)
+    if last is not None:
+        elapsed = time.monotonic() - last
+        if elapsed < ISSUE_RATE_LIMIT_SECONDS:
+            return ISSUE_RATE_LIMIT_SECONDS - elapsed
+    return None
+
+
+def _record_issue_for_rate_limit(user_id: int) -> None:
+    _user_issue_timestamps[user_id] = time.monotonic()
 
 
 def has_authorized_role(member: discord.Member) -> bool:
@@ -847,6 +966,18 @@ async def process_reaction(payload: discord.RawReactionActionEvent):
                 break
         if not match:
             return
+
+        remaining = _check_rate_limit(payload.user_id)
+        if remaining is not None:
+            try:
+                await target_message.reply(
+                    f"Rate-limited. Try again in {remaining:.0f}s.",
+                    mention_author=False,
+                )
+            except Exception:
+                pass
+            return
+
         try:
             await target_message.remove_reaction("📎", payload.member)
             await target_message.add_reaction("⏳")
@@ -857,6 +988,7 @@ async def process_reaction(payload: discord.RawReactionActionEvent):
             comment_url = await asyncio.to_thread(
                 add_comment_to_issue, match.repo_name, match.issue_number, comment_body
             )
+            _record_issue_for_rate_limit(payload.user_id)
             await target_message.remove_reaction("⏳", bot.user)
             await target_message.add_reaction("✅")
             await target_message.reply(
@@ -903,12 +1035,30 @@ async def process_reaction(payload: discord.RawReactionActionEvent):
     except Exception:
         pass
 
+    # Rate limit check
+    remaining = _check_rate_limit(payload.user_id)
+    if remaining is not None:
+        try:
+            await target_message.reply(
+                f"Rate-limited. Try again in {remaining:.0f}s.",
+                mention_author=False,
+            )
+        except Exception:
+            pass
+        return
+
     # Create issue using shared logic
     try:
         issue_number, issue_url = await create_issue_from_message(
-            target_message, channel, guild, repo_name, project_name, label,
+            target_message,
+            channel,
+            guild,
+            repo_name,
+            project_name,
+            label,
         )
 
+        _record_issue_for_rate_limit(payload.user_id)
         reply_msg = await target_message.reply(
             f"Created {project_name} issue #{issue_number}: <{issue_url}>",
             mention_author=False,
@@ -916,7 +1066,11 @@ async def process_reaction(payload: discord.RawReactionActionEvent):
         await target_message.add_reaction("✅")
 
         record_recent_issue(
-            channel.id, reply_msg.id, repo_name, issue_number, target_message.author.id,
+            channel.id,
+            reply_msg.id,
+            repo_name,
+            issue_number,
+            target_message.author.id,
         )
 
     except Exception:
@@ -1073,6 +1227,9 @@ if __name__ == "__main__":
         exit(1)
     if not GEMINI_API_KEY:
         print("Error: GEMINI_API_KEY not set")
+        exit(1)
+    if not IMAGES_URL:
+        print("Error: IMAGES_URL not set")
         exit(1)
 
     init()
