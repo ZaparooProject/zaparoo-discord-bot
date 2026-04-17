@@ -265,7 +265,7 @@ class TestProcessReaction:
         self, mock_reaction_payload, mock_channel, mock_message
     ):
         """When pending project exists, it should be used instead of default."""
-        import asyncio
+        import time
 
         from bot import pending_projects, process_reaction
 
@@ -275,7 +275,7 @@ class TestProcessReaction:
         pending_projects[12345] = (
             "pending/repo",
             "PendingProject",
-            asyncio.get_event_loop().time(),
+            time.time(),
         )
 
         with (

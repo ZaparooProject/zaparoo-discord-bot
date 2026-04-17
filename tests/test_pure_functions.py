@@ -149,7 +149,7 @@ class TestCleanupPending:
         from bot import cleanup_pending, pending_projects
 
         with patch("bot.PENDING_TIMEOUT", 60), patch("bot.time") as mock_time:
-            mock_time.monotonic.return_value = 1000.0
+            mock_time.time.return_value = 1000.0
 
             # Add an expired entry (timestamp 900, current 1000, timeout 60 = expired)
             pending_projects[123] = ("repo/name", "Project", 900.0)
@@ -169,7 +169,7 @@ class TestCleanupPending:
         from bot import cleanup_pending, pending_projects
 
         with patch("bot.PENDING_TIMEOUT", 60), patch("bot.time") as mock_time:
-            mock_time.monotonic.return_value = 1000.0
+            mock_time.time.return_value = 1000.0
 
             pending_projects[789] = ("repo/name", "Project", 980.0)
 
@@ -184,7 +184,7 @@ class TestCleanupPending:
         from bot import cleanup_pending, pending_projects
 
         with patch("bot.time") as mock_time:
-            mock_time.monotonic.return_value = 1000.0
+            mock_time.time.return_value = 1000.0
 
             pending_projects.clear()
             cleanup_pending()
@@ -199,7 +199,7 @@ class TestCleanupPending:
             patch("bot.RECENT_ISSUE_TTL", 3600),
             patch("bot.time") as mock_time,
         ):
-            mock_time.monotonic.return_value = 5000.0
+            mock_time.time.return_value = 5000.0
 
             recent_issues[111] = [
                 RecentIssue(1, "repo/a", 1, 100, 1000.0),  # expired (4000s ago)
@@ -221,7 +221,7 @@ class TestCleanupPending:
             patch("bot.ISSUE_RATE_LIMIT_SECONDS", 10),
             patch("bot.time") as mock_time,
         ):
-            mock_time.monotonic.return_value = 1000.0
+            mock_time.time.return_value = 1000.0
 
             _user_issue_timestamps.clear()
             _user_issue_timestamps[1] = 900.0  # stale: 100s ago, limit*2=20s
@@ -355,7 +355,7 @@ class TestRateLimit:
 
         _user_issue_timestamps.clear()
         with patch("bot.ISSUE_RATE_LIMIT_SECONDS", 10):
-            _user_issue_timestamps[42] = time.monotonic() - 11
+            _user_issue_timestamps[42] = time.time() - 11
             assert _check_rate_limit(42) is None
         _user_issue_timestamps.clear()
 
@@ -433,5 +433,100 @@ class TestRecordRecentIssue:
         assert entry.repo_name == "org/repo"
         assert entry.issue_number == 42
         assert entry.target_author_id == 12345
+
+        recent_issues.clear()
+
+    def test_caps_at_max_per_channel(self, monkeypatch, tmp_path):
+        """Should keep only the newest MAX_RECENT_PER_CHANNEL entries."""
+        import bot
+        from bot import recent_issues, record_recent_issue
+
+        monkeypatch.setattr(bot, "MAX_RECENT_PER_CHANNEL", 3)
+        monkeypatch.setattr(bot, "RECENT_ISSUES_FILE", tmp_path / "recent_issues.json")
+        monkeypatch.setattr(bot, "STATE_DIR", tmp_path)
+        recent_issues.clear()
+
+        for i in range(5):
+            record_recent_issue(111, i, "org/repo", i, 999)
+
+        assert len(recent_issues[111]) == 3
+        # Newest entries kept: issue_numbers 2, 3, 4
+        assert [e.issue_number for e in recent_issues[111]] == [2, 3, 4]
+
+        recent_issues.clear()
+
+
+class TestRecentIssuePersistence:
+    """Tests for save_recent_issues and load_recent_issues."""
+
+    def test_round_trip(self, tmp_path, monkeypatch):
+        """Saved state should be fully restored on load."""
+        import bot
+        from bot import RecentIssue, load_recent_issues, recent_issues, save_recent_issues
+
+        monkeypatch.setattr(bot, "RECENT_ISSUES_FILE", tmp_path / "recent_issues.json")
+        monkeypatch.setattr(bot, "STATE_DIR", tmp_path)
+
+        recent_issues.clear()
+        recent_issues[111] = [RecentIssue(1, "org/repo", 42, 999, time.time())]
+        save_recent_issues()
+
+        recent_issues.clear()
+        load_recent_issues()
+
+        assert 111 in recent_issues
+        assert len(recent_issues[111]) == 1
+        e = recent_issues[111][0]
+        assert e.issue_number == 42
+        assert e.repo_name == "org/repo"
+
+        recent_issues.clear()
+
+    def test_load_missing_file_is_noop(self, tmp_path, monkeypatch):
+        """Loading when no file exists should not raise and leave state empty."""
+        import bot
+        from bot import load_recent_issues, recent_issues
+
+        monkeypatch.setattr(bot, "RECENT_ISSUES_FILE", tmp_path / "nonexistent.json")
+        recent_issues.clear()
+        load_recent_issues()
+        assert recent_issues == {}
+
+    def test_load_corrupt_file_starts_fresh(self, tmp_path, monkeypatch):
+        """Corrupt JSON should be handled: state stays empty, no exception raised."""
+        import bot
+        from bot import load_recent_issues, recent_issues
+
+        state_file = tmp_path / "recent_issues.json"
+        state_file.write_text("not valid json {{{{")
+        monkeypatch.setattr(bot, "RECENT_ISSUES_FILE", state_file)
+
+        recent_issues[999] = []
+        load_recent_issues()
+        assert recent_issues == {}
+
+    def test_expired_entries_dropped_on_load(self, tmp_path, monkeypatch):
+        """Entries beyond RECENT_ISSUE_TTL should be purged when loading."""
+        import bot
+        from bot import RecentIssue, load_recent_issues, recent_issues, save_recent_issues
+
+        monkeypatch.setattr(bot, "RECENT_ISSUES_FILE", tmp_path / "recent_issues.json")
+        monkeypatch.setattr(bot, "STATE_DIR", tmp_path)
+        monkeypatch.setattr(bot, "RECENT_ISSUE_TTL", 3600)
+
+        recent_issues.clear()
+        old_ts = time.time() - 7200  # 2h ago, beyond 1h TTL
+        fresh_ts = time.time() - 60
+        recent_issues[111] = [
+            RecentIssue(1, "org/repo", 1, 100, old_ts),
+            RecentIssue(2, "org/repo", 2, 200, fresh_ts),
+        ]
+        save_recent_issues()
+
+        recent_issues.clear()
+        load_recent_issues()
+
+        assert len(recent_issues.get(111, [])) == 1
+        assert recent_issues[111][0].issue_number == 2
 
         recent_issues.clear()

@@ -4,6 +4,7 @@
 *.pem
 *.key
 images/
+state/
 .ruff_cache/
 __pycache__/
 .venv/

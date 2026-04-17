@@ -18,6 +18,7 @@ Only responds to reactions from users with the authorized role.
 
 import asyncio
 import hashlib
+import json
 import logging
 import os
 import re
@@ -54,6 +55,7 @@ _app_install = os.getenv("GITHUB_APP_INSTALLATION_ID")
 GITHUB_APP_INSTALLATION_ID = int(_app_install) if _app_install else None
 IMAGES_URL = os.getenv("IMAGES_URL", "")
 IMAGES_DIR = Path(os.getenv("IMAGES_DIR", "./images"))
+STATE_DIR = Path(os.getenv("STATE_DIR", "./state"))
 
 # Hardcoded config
 GEMINI_MODEL = "gemini-2.5-flash"
@@ -62,6 +64,9 @@ CONTEXT_MESSAGES = 5
 CONTEXT_GAP_SECONDS = 600
 PENDING_TIMEOUT = 60
 ISSUE_RATE_LIMIT_SECONDS = 10
+RECENT_ISSUE_TTL = 86400  # 24 hours
+MAX_RECENT_PER_CHANNEL = 50
+RECENT_ISSUES_FILE = STATE_DIR / "recent_issues.json"
 
 PROJECTS = {
     "🖥️": ("ZaparooProject/zaparoo-core", "Core"),
@@ -78,17 +83,43 @@ ISSUE_TYPES = {
 
 PROJECT_DESCRIPTIONS = {
     "ZaparooProject/zaparoo-core": (
-        "Core: The main service that runs on hardware (MiSTer, Steam Deck, "
-        "Raspberry Pi, etc). Handles NFC tag reading/writing, launching games/media, "
-        "REST API server, hardware integration, platform readers, and system service."
+        "Core: the backend service that runs on the host device and does "
+        "the actual work of reading tags, launching games/media, and "
+        "talking to emulators and frontends. Runs on MiSTer, Batocera, "
+        "BigBox, Retrobat, Windows, macOS, Linux, Raspberry Pi, and Steam "
+        "Deck. Covers: game and media launching, launchers and core/system "
+        "definitions (LLAPI, Kodi, mpv, arcade cores, 3DO, NeoGeo, etc.), "
+        "ZapScript, `config.toml`, the REST API and SSE notifications, "
+        "media library indexing and scanning, path handling and command "
+        "execution, the tray/taskbar icon, and hardware NFC readers "
+        "connected to the host (PN532, PC/SC, daemonbite, multi-reader "
+        "auto-detection). Crashes, high CPU, indexing hangs, and 'nightly "
+        "fuzz' reports belong here."
     ),
     "ZaparooProject/zaparoo-app": (
-        "App: The mobile/desktop companion app. UI for browsing media libraries, "
-        "managing NFC cards, searching games, and configuring the core service remotely."
+        "App: the Capacitor/React UI shipped as the iOS and Android phone "
+        "app, and also embedded inside Core as its web interface. Covers: "
+        "everything the user sees and taps in that UI. Mapping list and "
+        "management, search filters (alternates, duplicates), arcade coin "
+        "insertion when writing a tag, launch-on-scan and other settings "
+        "toggles, device pairing / server address entry, translations, "
+        "and in-app purchases / Pro / 'restore purchase' / Play Store / "
+        "App Store issues. Writing NFC tags using the phone's built-in "
+        "NFC sensor is App. If the user is describing UI behavior, "
+        "layout, or wording, even when it's the UI running inside Core, "
+        "it is almost always App."
     ),
     "ZaparooProject/zaparoo-designer": (
-        "Designer: Web-based card and label design tool. Templates, custom artwork, "
-        "printing layouts, and label generation for NFC cards."
+        "Designer: the browser-only label/card design tool at "
+        "design.zaparoo.org. No backend, no accounts, everything runs "
+        "locally in the browser. Covers: card and label templates (trading "
+        "card, Commodore, casse, custom), the canvas editor (layers, "
+        "object selection, grid snapping, angle snapping, rotation), "
+        "artwork search via IGDB and SteamGridDB, print layouts and page "
+        "sizes (including credit-card size), PDF / PNG / Zip export, "
+        "colors and color reset, WEBP and vector image handling, and "
+        "browser-specific rendering bugs (Firefox scrollbars, Chrome "
+        "selection, etc.)."
     ),
 }
 
@@ -152,7 +183,6 @@ class RecentIssue(NamedTuple):
 
 # Track recently created issues for follow-up attachment (channel_id -> entries)
 recent_issues: dict[int, list[RecentIssue]] = {}
-RECENT_ISSUE_TTL = 86400  # 24 hours
 
 # Per-user issue creation timestamps for rate limiting
 _user_issue_timestamps: dict[int, float] = {}
@@ -348,6 +378,7 @@ def init():
         logging.info("Using GitHub token authentication")
 
     IMAGES_DIR.mkdir(parents=True, exist_ok=True)
+    load_recent_issues()
 
 
 async def generate_issue_title(body: str) -> str:
@@ -363,13 +394,15 @@ async def generate_issue_title(body: str) -> str:
                     "Write a short sentence (8-15 words) that describes the specific "
                     "problem or request. Be descriptive and include relevant details. "
                     "Output only the title, no quotes or prefixes. Use sentence case. "
-                    "Do not mention if there are attachments or not."
+                    "Do not mention if there are attachments or not. "
+                    "If the body contains no meaningful text to generate a title from, "
+                    "reply with exactly: Needs more information"
                 ),
                 max_output_tokens=60,
                 temperature=0.3,
             ),
         )
-        return response.text.strip()
+        return response.text.strip() if response.text else "Needs more information"
     except Exception:
         logging.exception("Failed to generate title")
         return "Issue from Discord"
@@ -398,10 +431,11 @@ async def detect_project(message_content: str) -> tuple[str, str] | None:
                 max_output_tokens=30,
             ),
         )
-        result = response.text.strip()
-        for _, (repo, name) in PROJECTS.items():
-            if repo in result:
-                return repo, name
+        if response.text:
+            result = response.text.strip()
+            for _, (repo, name) in PROJECTS.items():
+                if repo in result:
+                    return repo, name
     except Exception:
         logging.exception("Failed to detect project")
     return None
@@ -707,6 +741,37 @@ async def build_followup_comment(message: discord.Message) -> str:
     return "\n".join(parts)
 
 
+def save_recent_issues() -> None:
+    """Atomically write recent_issues to disk."""
+    try:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        data = {
+            str(cid): [list(entry) for entry in entries]
+            for cid, entries in recent_issues.items()
+        }
+        tmp = RECENT_ISSUES_FILE.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(data))
+        tmp.replace(RECENT_ISSUES_FILE)
+    except Exception:
+        logging.exception("Failed to save recent_issues")
+
+
+def load_recent_issues() -> None:
+    """Load recent_issues from disk. Starts fresh silently on any error."""
+    if not RECENT_ISSUES_FILE.exists():
+        return
+    try:
+        raw = json.loads(RECENT_ISSUES_FILE.read_text())
+        for cid, entries in raw.items():
+            recent_issues[int(cid)] = [RecentIssue(*e) for e in entries]
+        cleanup_pending()
+        count = sum(len(v) for v in recent_issues.values())
+        logging.info(f"Loaded {count} recent issue(s) from state")
+    except Exception:
+        logging.exception("Failed to load recent_issues, starting fresh")
+        recent_issues.clear()
+
+
 def record_recent_issue(
     channel_id: int,
     bot_reply_msg_id: int,
@@ -716,17 +781,19 @@ def record_recent_issue(
 ):
     """Record a recently created issue for follow-up attachment."""
     cleanup_pending()
-    if channel_id not in recent_issues:
-        recent_issues[channel_id] = []
-    recent_issues[channel_id].append(
+    entries = recent_issues.setdefault(channel_id, [])
+    entries.append(
         RecentIssue(
             bot_reply_msg_id,
             repo_name,
             issue_number,
             target_author_id,
-            time.monotonic(),
+            time.time(),
         )
     )
+    if len(entries) > MAX_RECENT_PER_CHANNEL:
+        del entries[:-MAX_RECENT_PER_CHANNEL]
+    save_recent_issues()
 
 
 async def create_issue_from_message(
@@ -851,7 +918,7 @@ async def create_issue_from_message(
 
 def cleanup_pending():
     """Remove expired pending selections, old recent issues, and stale rate limit entries."""
-    now = time.monotonic()
+    now = time.time()
     expired = [
         msg_id
         for msg_id, (_, _, timestamp) in pending_projects.items()
@@ -860,6 +927,7 @@ def cleanup_pending():
     for msg_id in expired:
         del pending_projects[msg_id]
 
+    before = sum(len(v) for v in recent_issues.values())
     for channel_id in list(recent_issues):
         recent_issues[channel_id] = [
             entry
@@ -868,6 +936,8 @@ def cleanup_pending():
         ]
         if not recent_issues[channel_id]:
             del recent_issues[channel_id]
+    if sum(len(v) for v in recent_issues.values()) != before:
+        save_recent_issues()
 
     stale_users = [
         uid for uid, ts in _user_issue_timestamps.items() if now - ts > ISSUE_RATE_LIMIT_SECONDS * 2
@@ -880,14 +950,14 @@ def _check_rate_limit(user_id: int) -> float | None:
     """Return seconds remaining in cooldown if rate-limited, else None."""
     last = _user_issue_timestamps.get(user_id)
     if last is not None:
-        elapsed = time.monotonic() - last
+        elapsed = time.time() - last
         if elapsed < ISSUE_RATE_LIMIT_SECONDS:
             return ISSUE_RATE_LIMIT_SECONDS - elapsed
     return None
 
 
 def _record_issue_for_rate_limit(user_id: int) -> None:
-    _user_issue_timestamps[user_id] = time.monotonic()
+    _user_issue_timestamps[user_id] = time.time()
 
 
 def has_authorized_role(member: discord.Member) -> bool:
@@ -918,7 +988,7 @@ async def process_reaction(payload: discord.RawReactionActionEvent):
     # Check if this is a project selection
     if emoji in PROJECTS:
         repo, name = PROJECTS[emoji]
-        pending_projects[message_id] = (repo, name, time.monotonic())
+        pending_projects[message_id] = (repo, name, time.time())
         logging.info(f"Project selected: {name} ({repo}) for message {message_id}")
 
         # Add a visual indicator
@@ -965,6 +1035,7 @@ async def process_reaction(payload: discord.RawReactionActionEvent):
                 await target_message.reply(
                     f"Rate-limited. Try again in {remaining:.0f}s.",
                     mention_author=False,
+                    delete_after=10,
                 )
             except Exception:
                 pass
@@ -977,16 +1048,12 @@ async def process_reaction(payload: discord.RawReactionActionEvent):
             pass
         try:
             comment_body = await build_followup_comment(target_message)
-            comment_url = await asyncio.to_thread(
+            await asyncio.to_thread(
                 add_comment_to_issue, match.repo_name, match.issue_number, comment_body
             )
             _record_issue_for_rate_limit(payload.user_id)
             await target_message.remove_reaction("⏳", bot.user)
             await target_message.add_reaction("✅")
-            await target_message.reply(
-                f"Attached to issue #{match.issue_number}: <{comment_url}>",
-                mention_author=False,
-            )
             logging.info(f"Attached follow-up to issue #{match.issue_number}")
         except Exception:
             logging.exception("Failed to attach follow-up")
@@ -1034,10 +1101,16 @@ async def process_reaction(payload: discord.RawReactionActionEvent):
             await target_message.reply(
                 f"Rate-limited. Try again in {remaining:.0f}s.",
                 mention_author=False,
+                delete_after=10,
             )
         except Exception:
             pass
         return
+
+    try:
+        await target_message.add_reaction("⏳")
+    except Exception:
+        pass
 
     # Create issue using shared logic
     try:
@@ -1055,6 +1128,10 @@ async def process_reaction(payload: discord.RawReactionActionEvent):
             f"Created {project_name} issue #{issue_number}: <{issue_url}>",
             mention_author=False,
         )
+        try:
+            await target_message.remove_reaction("⏳", bot.user)
+        except Exception:
+            pass
         await target_message.add_reaction("✅")
 
         record_recent_issue(
@@ -1067,6 +1144,10 @@ async def process_reaction(payload: discord.RawReactionActionEvent):
 
     except Exception:
         logging.exception("Failed to create issue")
+        try:
+            await target_message.remove_reaction("⏳", bot.user)
+        except Exception:
+            pass
         await target_message.add_reaction("❌")
 
         try:
