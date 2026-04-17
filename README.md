@@ -1,80 +1,109 @@
 # Discord Issue Bot
 
-A Discord bot that creates GitHub issues from Discord messages when you react with specific emoji. Supports multiple projects with an optional two-step reaction flow.
+A Discord bot that creates GitHub issues from Discord messages, either via emoji reactions or the right-click Apps context menu. Built for the [Zaparoo](https://zaparoo.org) project but configurable for any GitHub repository.
 
 ## Features
 
-- **Multi-project support**: Configure multiple GitHub repos with different emoji
-- **Two-step flow**: React with project emoji, then issue type (optional)
-- **Single-step flow**: Just react with issue type to use default project
-- **Role-based authorization**: Only users with specified role can trigger issue creation
-- **Context included**: Captures previous messages for context
-- **File hosting**: Downloads attachments and serves them locally
-- **Auto-reply**: Bot replies with the issue number and link
+- **Reaction flow**: React to any message with emoji to create a GitHub issue from it
+- **Context menu**: Right-click a message and use "Create Issue" to pick project and type from dropdowns
+- **Smart context**: Gathers surrounding conversation for context, using Gemini to filter relevance
+- **Auto-detect project**: If you don't specify a project emoji, Gemini classifies the message automatically
+- **Follow-up attachment**: React with 📎 to attach a later message to an already-created issue as a comment
+- **Support responses**: Right-click context menu commands that post pre-written support replies
+- **File hosting**: Saves attachments locally and embeds them in the issue body
+- **Role-based authorization**: Only users with a specified role can trigger issue creation
+- **State persistence**: Recently created issues are saved to disk so 📎 follow-up survives restarts
 
 ## How It Works
 
-### Single-Step (Quick)
-React with an issue type emoji -> Creates issue on **default project**
+### Reaction Flow
+
+React to a message with issue type emoji to create an issue on the default project:
 
 ```
-User message: "The app crashes when I tap a card"
-You react: bug emoji
-Bot creates: Bug issue on default project (e.g., Core)
+User: "The app crashes when I tap a card"
+You react: 🐛
+Bot creates: bug issue on default project, replies with link
 ```
 
-### Two-Step (Specific Project)
-1. React with project emoji (bot adds hourglass to show it's waiting)
-2. React with issue type emoji -> Creates issue on that project
+To target a specific project, react with the project emoji first:
 
 ```
-User message: "The app crashes when I tap a card"
-You react: app emoji (selects App project)
-Bot reacts: hourglass (waiting for issue type)
-You react: bug emoji
-Bot creates: Bug issue on App
+You react: 📱  (selects App project, bot shows ⏳)
+You react: 🐛  (creates bug issue on App)
 ```
+
+The project selection expires after 60 seconds.
+
+### Context Menu
+
+Right-click any message -> Apps -> **Create Issue** to open a modal with project and issue type dropdowns.
+
+### Follow-up Attachment
+
+React with 📎 on any message to attach it as a comment to the most recently created issue in that channel (within the last 24 hours).
+
+### Support Responses
+
+Right-click any message -> Apps to find pre-written support reply commands (e.g. "Request Troubleshooting"). These post an embed with links directly in the channel as a reply to the message.
 
 ## Configuration
 
-Projects, issue types, and support responses are hardcoded in `bot.py`. Edit them directly to customize for your Discord server.
+Projects, issue types, and support responses are hardcoded in `bot.py`. Edit them directly:
 
-Secrets and deployment-specific settings go in `.env` (see below).
+- `PROJECTS` — emoji to `(repo, name)` mapping
+- `ISSUE_TYPES` — emoji to label mapping
+- `SUPPORT_RESPONSES` — list of context menu support reply commands
+- `PROJECT_DESCRIPTIONS` — text descriptions fed to Gemini for auto-detection
 
-## Quick Start
+Secrets and deployment-specific settings go in `.env`.
+
+## Setup
 
 ### 1. Create a Discord Bot
 
-1. Go to [Discord Developer Portal](https://discord.com/developers/applications)
-2. Click "New Application" -> name it -> Create
-3. Go to "Bot" tab -> Click "Reset Token" -> Copy the token
-4. Enable these **Privileged Gateway Intents**:
-   - Message Content Intent
-5. Go to "OAuth2" -> "URL Generator"
-   - Scopes: `bot`
+1. Go to the [Discord Developer Portal](https://discord.com/developers/applications)
+2. New Application -> name it -> Create
+3. Bot tab -> Reset Token -> copy the token
+4. Enable **Privileged Gateway Intents**: Message Content Intent
+5. OAuth2 -> URL Generator:
+   - Scopes: `bot`, `applications.commands`
    - Bot Permissions: `Read Messages/View Channels`, `Send Messages`, `Add Reactions`, `Read Message History`
-6. Copy the generated URL and open it to invite the bot to your server
+6. Open the generated URL to invite the bot to your server
 
 ### 2. Get Your Discord Role ID
 
-1. In Discord, go to Settings -> Advanced -> Enable "Developer Mode"
-2. Create a role in your server for bot authorization (Server Settings -> Roles)
-3. Right-click the role -> "Copy Role ID"
-4. Assign this role to users who should be able to create issues
+1. Discord Settings -> Advanced -> enable Developer Mode
+2. Create a role for authorized users (Server Settings -> Roles)
+3. Right-click the role -> Copy Role ID
 
-### 3. Create a GitHub Token
+### 3. GitHub Auth
 
-1. Go to [GitHub Settings -> Fine-grained tokens](https://github.com/settings/tokens?type=beta)
-2. Click "Generate new token"
-3. Select repositories you want to create issues on
-4. Permissions: `Issues` -> Read and Write
-5. Generate and copy the token
+**Option A: Personal access token**
 
-### 4. Configure and Run
+1. [GitHub Settings -> Fine-grained tokens](https://github.com/settings/tokens?type=beta)
+2. Select the target repositories, grant Issues: Read and Write
+3. Set `GITHUB_TOKEN` in `.env`
+
+**Option B: GitHub App** (issues created as the bot account)
+
+1. [GitHub Settings -> Developer settings -> GitHub Apps](https://github.com/settings/apps) -> New GitHub App
+2. Grant Issues: Read and Write, subscribe to no events
+3. Install the app on your repositories
+4. Set `GITHUB_APP_ID`, `GITHUB_APP_PRIVATE_KEY_PATH`, and `GITHUB_APP_INSTALLATION_ID` in `.env`
+
+### 4. Get a Gemini API Key
+
+1. Go to [Google AI Studio](https://aistudio.google.com/apikey)
+2. Create an API key and set `GEMINI_API_KEY` in `.env`
+
+Gemini is used to generate issue titles and auto-detect which project a message relates to.
+
+### 5. Run
 
 ```bash
 cp .env.example .env
-# Edit .env with your tokens and settings
+# Fill in your tokens
 
 uv run bot.py
 ```
@@ -84,21 +113,23 @@ uv run bot.py
 | Variable | Required | Description |
 |----------|----------|-------------|
 | `DISCORD_TOKEN` | Yes | Discord bot token |
-| `GEMINI_API_KEY` | Yes | Google Gemini API key for AI features |
+| `GEMINI_API_KEY` | Yes | Google Gemini API key |
 | `AUTHORIZED_ROLE_ID` | Yes | Discord role ID for authorized users |
 | `GITHUB_TOKEN` | Yes* | GitHub personal access token |
-| `GITHUB_APP_ID` | Yes* | GitHub App ID (alternative to token) |
+| `GITHUB_APP_ID` | Yes* | GitHub App ID |
 | `GITHUB_APP_PRIVATE_KEY_PATH` | Yes* | Path to GitHub App private key PEM file |
 | `GITHUB_APP_INSTALLATION_ID` | Yes* | GitHub App installation ID |
-| `IMAGES_URL` | No | Public URL for files served by nginx |
+| `IMAGES_DIR` | No | Directory to save attachments (default: `./images`) |
+| `IMAGES_URL` | No | Public base URL for saved attachments |
+| `STATE_DIR` | No | Directory to persist bot state (default: `./state`) |
 
-*GitHub auth: set either `GITHUB_TOKEN` **or** all three `GITHUB_APP_*` variables.
+\* GitHub auth: set either `GITHUB_TOKEN` **or** all three `GITHUB_APP_*` variables.
 
 ## File Hosting
 
-The bot saves downloaded attachments (images, .txt, .log files) locally. You need to serve them via nginx or similar.
+The bot saves attachments (images, `.txt`, `.log` files) to `IMAGES_DIR` and embeds them in issue bodies using `IMAGES_URL`. You need to serve `IMAGES_DIR` via nginx or similar.
 
-### Example nginx config
+Example nginx config:
 
 ```nginx
 location /discord-files/ {
@@ -116,51 +147,37 @@ location /discord-files/ {
 }
 ```
 
-Then set `IMAGES_URL=https://your-domain.com/discord-files`
+Set `IMAGES_URL=https://your-domain.com/discord-files` and `IMAGES_DIR=/path/to/images`.
 
 ## Deployment
 
-Copy files to `/opt/discord-issue-bot/` and use the included systemd service:
+### systemd
+
+A `discord-issue-bot.service` file is included. Adjust paths and user, then:
 
 ```bash
 sudo cp discord-issue-bot.service /etc/systemd/system/
 sudo systemctl daemon-reload
-sudo systemctl enable discord-issue-bot
-sudo systemctl start discord-issue-bot
+sudo systemctl enable --now discord-issue-bot
 ```
 
-## Example Issue Output
+Add `ReadWritePaths=/path/to/state` to the service file if using `STATE_DIR`.
 
-```markdown
-*Issue created from Discord*
+### Docker
 
-**Source:** [Zaparoo / #support](https://discord.com/channels/...)
+Example `docker-compose.yml` service:
 
----
-
-### Reported Message
-
-**>>> Target Message:**
-> **UserB** (@userb) - 2024-01-15 10:32 UTC
-> Yeah I get it too when I tap a card right after boot.
-> Happens every time on my MiSTer.
-
-### Context (previous messages)
-
-> **UserA** (@usera) - 2024-01-15 10:30 UTC
-> Has anyone else seen this crash?
-
-### Attachments
-
-![screenshot.png](https://your-server.com/images/20240115_103245_abc123.png)
+```yaml
+discord-bot:
+  build: /opt/discord-issue-bot
+  restart: unless-stopped
+  env_file: /opt/discord-issue-bot/.env
+  volumes:
+    - /path/to/images:/app/images:rw
+    - /path/to/state:/app/state:rw
+    - /path/to/key.pem:/app/key.pem:ro
 ```
-
-## Commands
-
-| Command | Description |
-|---------|-------------|
-| `!help` | Show help (only visible to authorized role) |
 
 ## License
 
-MIT
+GNU General Public License v3.0. See [LICENSE](LICENSE).
