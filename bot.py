@@ -160,7 +160,10 @@ SUPPORT_RESPONSES: list[SupportResponse] = [
         ),
         "buttons": [
             {"label": "Docs", "url": "https://zaparoo.org/docs/"},
-            {"label": "Known Issues", "url": "https://github.com/ZaparooProject/zaparoo-core/issues"},
+            {
+                "label": "Known Issues",
+                "url": "https://github.com/ZaparooProject/zaparoo-core/issues",
+            },
         ],
     },
 ]
@@ -394,15 +397,16 @@ async def generate_issue_title(body: str) -> str:
                     "Write a short sentence (8-15 words) that describes the specific "
                     "problem or request. Be descriptive and include relevant details. "
                     "Output only the title, no quotes or prefixes. Use sentence case. "
-                    "Do not mention if there are attachments or not. "
-                    "If the body contains no meaningful text to generate a title from, "
-                    "reply with exactly: Needs more information"
+                    "Focus on the Reported Message. If the reported message has no text "
+                    "content, derive the title from the attachment filename(s) instead "
+                    "(e.g. 'Crash log report: zaparoo-core-2024-01-15.log')."
                 ),
                 max_output_tokens=60,
                 temperature=0.3,
+                thinking_config=types.ThinkingConfig(thinking_budget=0),
             ),
         )
-        return response.text.strip() if response.text else "Needs more information"
+        return response.text.strip() if response.text else "Issue from Discord"
     except Exception:
         logging.exception("Failed to generate title")
         return "Issue from Discord"
@@ -429,6 +433,7 @@ async def detect_project(message_content: str) -> tuple[str, str] | None:
                 ),
                 temperature=0.0,
                 max_output_tokens=30,
+                thinking_config=types.ThinkingConfig(thinking_budget=0),
             ),
         )
         if response.text:
@@ -520,6 +525,7 @@ async def filter_context_with_llm(
             ),
             temperature=0.0,
             max_output_tokens=100,
+            thinking_config=types.ThinkingConfig(thinking_budget=0),
         ),
     )
 
@@ -746,8 +752,7 @@ def save_recent_issues() -> None:
     try:
         STATE_DIR.mkdir(parents=True, exist_ok=True)
         data = {
-            str(cid): [list(entry) for entry in entries]
-            for cid, entries in recent_issues.items()
+            str(cid): [list(entry) for entry in entries] for cid, entries in recent_issues.items()
         }
         tmp = RECENT_ISSUES_FILE.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(data))
