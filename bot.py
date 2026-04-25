@@ -81,49 +81,6 @@ ISSUE_TYPES = {
     "📋": None,
 }
 
-PROJECT_DESCRIPTIONS = {
-    "ZaparooProject/zaparoo-core": (
-        "Core: the backend service that runs on the host device and does "
-        "the actual work of reading tags, launching games/media, and "
-        "talking to emulators and frontends. Runs on MiSTer, Batocera, "
-        "BigBox, Retrobat, Windows, macOS, Linux, Raspberry Pi, and Steam "
-        "Deck. Covers: game and media launching, launchers and core/system "
-        "definitions (LLAPI, Kodi, mpv, arcade cores, 3DO, NeoGeo, etc.), "
-        "ZapScript, `config.toml`, the REST API and SSE notifications, "
-        "media library indexing and scanning, path handling and command "
-        "execution, the tray/taskbar icon, and hardware NFC readers "
-        "connected to the host (PN532, PC/SC, daemonbite, multi-reader "
-        "auto-detection). Crashes, high CPU, indexing hangs, and 'nightly "
-        "fuzz' reports belong here."
-    ),
-    "ZaparooProject/zaparoo-app": (
-        "App: the Capacitor/React UI shipped as the iOS and Android phone "
-        "app, and also embedded inside Core as its web interface. Covers: "
-        "everything the user sees and taps in that UI. Mapping list and "
-        "management, search filters (alternates, duplicates), arcade coin "
-        "insertion when writing a tag, launch-on-scan and other settings "
-        "toggles, device pairing / server address entry, translations, "
-        "and in-app purchases / Pro / 'restore purchase' / Play Store / "
-        "App Store issues. Writing NFC tags using the phone's built-in "
-        "NFC sensor is App. If the user is describing UI behavior, "
-        "layout, or wording, even when it's the UI running inside Core, "
-        "it is almost always App."
-    ),
-    "ZaparooProject/zaparoo-designer": (
-        "Designer: the browser-only label/card design tool at "
-        "design.zaparoo.org. No backend, no accounts, everything runs "
-        "locally in the browser. Covers: card and label templates (trading "
-        "card, Commodore, casse, custom), the canvas editor (layers, "
-        "object selection, grid snapping, angle snapping, rotation), "
-        "artwork search via IGDB and SteamGridDB, print layouts and page "
-        "sizes (including credit-card size), PDF / PNG / Zip export, "
-        "colors and color reset, WEBP and vector image handling, and "
-        "browser-specific rendering bugs (Firefox scrollbars, Chrome "
-        "selection, etc.)."
-    ),
-}
-
-
 class SupportButton(TypedDict, total=False):
     label: str
     url: str
@@ -410,40 +367,6 @@ async def generate_issue_title(body: str) -> str:
     except Exception:
         logging.exception("Failed to generate title")
         return "Issue from Discord"
-
-
-async def detect_project(message_content: str) -> tuple[str, str] | None:
-    """Use Gemini to detect which project a message relates to.
-
-    Returns (repo_name, project_name) or None if unclear.
-    """
-    descriptions = "\n".join(f"- {repo}: {desc}" for repo, desc in PROJECT_DESCRIPTIONS.items())
-    try:
-        response = await gemini_client.aio.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=message_content,
-            config=types.GenerateContentConfig(
-                system_instruction=(
-                    "You classify Discord support messages to the correct project.\n\n"
-                    f"Projects:\n{descriptions}\n\n"
-                    "Based on the message, determine which project it relates to. "
-                    "Reply with ONLY the repository name (e.g., 'ZaparooProject/zaparoo-core'). "
-                    "If the message could apply to multiple projects or is unclear, "
-                    "reply 'unknown'."
-                ),
-                temperature=0.0,
-                max_output_tokens=30,
-                thinking_config=types.ThinkingConfig(thinking_budget=0),
-            ),
-        )
-        if response.text:
-            result = response.text.strip()
-            for _, (repo, name) in PROJECTS.items():
-                if repo in result:
-                    return repo, name
-    except Exception:
-        logging.exception("Failed to detect project")
-    return None
 
 
 async def walk_reply_chain(
@@ -1082,16 +1005,12 @@ async def process_reaction(payload: discord.RawReactionActionEvent):
         logging.exception("Could not fetch message")
         return
 
-    # Get project (from pending, auto-detect, or default)
+    # Get project from pending selection, otherwise use default
     if message_id in pending_projects:
         repo_name, project_name = pending_projects.pop(message_id)[:2]
     else:
-        detected = await detect_project(target_message.content)
-        if detected:
-            repo_name, project_name = detected
-            logging.info(f"Auto-detected project: {project_name}")
-        else:
-            repo_name, project_name = DEFAULT_PROJECT
+        repo_name, project_name = DEFAULT_PROJECT
+        logging.info(f"No project selected; using default project: {project_name}")
 
     # Remove pending indicator if present
     try:
@@ -1271,7 +1190,7 @@ async def help(ctx):
 2. React with issue type to create issue
 
 **Single-step flow:**
-- Just react with issue type → bot auto-detects project (fallback: {default_name})
+- Just react with issue type → creates issue in {default_name}
 
 **Projects:**
 {projects_list}
@@ -1287,7 +1206,7 @@ Or reply to the bot's issue confirmation message
 
 **Example:**
 - React 📱 then 🐛 → Bug on App
-- React 🐛 only → Bug on auto-detected project
+- React 🐛 only → Bug on {default_name}
 """
     await ctx.send(help_text)
 

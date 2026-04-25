@@ -7,7 +7,7 @@ A Discord bot that creates GitHub issues from Discord messages, either via emoji
 - **Reaction flow**: React to any message with emoji to create a GitHub issue from it
 - **Context menu**: Right-click a message and use "Create Issue" to pick project and type from dropdowns
 - **Smart context**: Gathers surrounding conversation for context, using Gemini to filter relevance
-- **Auto-detect project**: If you don't specify a project emoji, Gemini classifies the message automatically
+- **Default project fallback**: If you don't specify a project emoji, the issue is created in the default project
 - **Follow-up attachment**: React with 📎 to attach a later message to an already-created issue as a comment
 - **Support responses**: Right-click context menu commands that post pre-written support replies
 - **File hosting**: Saves attachments locally and embeds them in the issue body
@@ -54,7 +54,6 @@ Projects, issue types, and support responses are hardcoded in `bot.py`. Edit the
 - `PROJECTS` — emoji to `(repo, name)` mapping
 - `ISSUE_TYPES` — emoji to label mapping
 - `SUPPORT_RESPONSES` — list of context menu support reply commands
-- `PROJECT_DESCRIPTIONS` — text descriptions fed to Gemini for auto-detection
 
 Secrets and deployment-specific settings go in `.env`.
 
@@ -97,7 +96,7 @@ Secrets and deployment-specific settings go in `.env`.
 1. Go to [Google AI Studio](https://aistudio.google.com/apikey)
 2. Create an API key and set `GEMINI_API_KEY` in `.env`
 
-Gemini is used to generate issue titles and auto-detect which project a message relates to.
+Gemini is used to generate issue titles and filter relevant conversation context.
 
 ### 5. Run
 

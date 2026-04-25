@@ -332,6 +332,68 @@ class TestProcessReaction:
 
         pending_projects.clear()
 
+    @pytest.mark.asyncio
+    async def test_uses_default_project_without_pending_selection(
+        self, mock_reaction_payload, mock_channel, mock_message
+    ):
+        """When no project is selected, issue reactions should use the default project."""
+        from bot import pending_projects, process_reaction
+
+        pending_projects.clear()
+
+        with (
+            patch("bot.AUTHORIZED_ROLE_ID", 99999),
+            patch("bot.ISSUE_TYPES", {"🐛": "bug"}),
+            patch("bot.DEFAULT_PROJECT", ("default/repo", "DefaultProject")),
+        ):
+            payload = mock_reaction_payload(emoji="🐛", member_roles=[99999], message_id=12345)
+
+            channel = mock_channel()
+            msg = mock_message()
+            channel.fetch_message.return_value = msg
+
+            mock_guild = MagicMock()
+            mock_guild.get_member.return_value = None
+
+            async def empty_history(*args, **kwargs):
+                return
+                yield
+
+            channel.history.return_value = empty_history()
+
+            mock_issue = MagicMock()
+            mock_issue.number = 99
+            mock_issue.html_url = "https://github.com/default/repo/issues/99"
+
+            mock_repo = MagicMock()
+            mock_repo.get_labels.return_value = []
+            mock_repo.create_issue.return_value = mock_issue
+
+            mock_github = MagicMock()
+            mock_github.get_repo.return_value = mock_repo
+
+            mock_gemini = MagicMock()
+            mock_gemini.aio.models.generate_content = AsyncMock(
+                return_value=MagicMock(text="Test title")
+            )
+
+            with (
+                patch("bot.bot") as mock_bot,
+                patch("bot.github_client", mock_github),
+                patch("bot.gemini_client", mock_gemini),
+            ):
+                mock_bot.get_guild.return_value = mock_guild
+                mock_bot.get_channel.return_value = channel
+                mock_bot.user = MagicMock()
+                mock_bot.http_session = MagicMock()
+
+                await process_reaction(payload)
+
+                mock_github.get_repo.assert_called_with("default/repo")
+                mock_gemini.aio.models.generate_content.assert_awaited_once()
+
+        pending_projects.clear()
+
 
 class TestChannelFetching:
     """Tests for channel fetching fallback."""
@@ -911,51 +973,6 @@ class TestGuildHandling:
 
                 # Should complete without error
                 await process_reaction(payload)
-
-
-class TestDetectProject:
-    """Tests for the detect_project function."""
-
-    @pytest.mark.asyncio
-    async def test_detects_correct_project(self):
-        """Should return the matching project when LLM identifies it."""
-        from bot import detect_project
-
-        mock_client = MagicMock()
-        mock_client.aio.models.generate_content = AsyncMock(
-            return_value=MagicMock(text="ZaparooProject/zaparoo-app")
-        )
-
-        with patch("bot.gemini_client", mock_client):
-            result = await detect_project("The app crashes when I tap a card")
-
-        assert result == ("ZaparooProject/zaparoo-app", "App")
-
-    @pytest.mark.asyncio
-    async def test_returns_none_for_unknown(self):
-        """Should return None when LLM says unknown."""
-        from bot import detect_project
-
-        mock_client = MagicMock()
-        mock_client.aio.models.generate_content = AsyncMock(return_value=MagicMock(text="unknown"))
-
-        with patch("bot.gemini_client", mock_client):
-            result = await detect_project("Some vague question")
-
-        assert result is None
-
-    @pytest.mark.asyncio
-    async def test_returns_none_on_failure(self):
-        """Should return None when LLM call fails."""
-        from bot import detect_project
-
-        mock_client = MagicMock()
-        mock_client.aio.models.generate_content = AsyncMock(side_effect=Exception("API Error"))
-
-        with patch("bot.gemini_client", mock_client):
-            result = await detect_project("Some message")
-
-        assert result is None
 
 
 class TestWalkReplyChain:
