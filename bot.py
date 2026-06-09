@@ -104,7 +104,7 @@ SUPPORT_RESPONSES: list[SupportResponse] = [
             "**In the App**: go to **Settings > Advanced > View logs** "
             "and tap **Upload** for a shareable link.\n"
             "\n"
-            "**In Zaparoo Frontend**: go to "
+            "**In Frontend**: go to "
             "**Settings > Support > Upload log file** for a shareable link.\n"
             "\n"
             "**In the TUI**: go to **Settings > Logs** and select "
