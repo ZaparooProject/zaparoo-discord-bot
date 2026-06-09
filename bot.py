@@ -72,6 +72,7 @@ PROJECTS = {
     "🖥️": ("ZaparooProject/zaparoo-core", "Core"),
     "📱": ("ZaparooProject/zaparoo-app", "App"),
     "🎨": ("ZaparooProject/zaparoo-designer", "Designer"),
+    "🚀": ("ZaparooProject/zaparoo-frontend", "Frontend"),
 }
 DEFAULT_PROJECT = list(PROJECTS.values())[0]
 
@@ -102,6 +103,9 @@ SUPPORT_RESPONSES: list[SupportResponse] = [
             "\n"
             "**In the App**: go to **Settings > Advanced > View logs** "
             "and tap **Upload** for a shareable link.\n"
+            "\n"
+            "**In Zaparoo Frontend**: go to "
+            "**Settings > Support > Upload log file** for a shareable link.\n"
             "\n"
             "**In the TUI**: go to **Settings > Logs** and select "
             "**Upload** for a shareable link.\n"
