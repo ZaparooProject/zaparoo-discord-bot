@@ -209,10 +209,12 @@ def clear_bot_globals():
 
     bot.pending_projects.clear()
     bot.recent_issues.clear()
+    bot.issue_jobs.clear()
     bot._user_issue_timestamps.clear()
     yield
     bot.pending_projects.clear()
     bot.recent_issues.clear()
+    bot.issue_jobs.clear()
     bot._user_issue_timestamps.clear()
 
 
