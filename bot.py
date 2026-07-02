@@ -221,6 +221,14 @@ async def send_private_error(
         logging.exception("Failed to send private error")
 
 
+async def delete_original_response_if_present(interaction: discord.Interaction) -> None:
+    """Best-effort cleanup for ephemeral interaction placeholders."""
+    try:
+        await interaction.delete_original_response()
+    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+        logging.debug("Failed to delete interaction response", exc_info=True)
+
+
 def make_support_callback(response_config: dict):
     """Create a context menu callback for a support response."""
     title = response_config.get("title", "Support")
@@ -254,10 +262,7 @@ def make_support_callback(response_config: dict):
         await interaction.response.defer(ephemeral=True, thinking=True)
         try:
             await message.reply(embed=embed, view=view, mention_author=False)
-            try:
-                await interaction.delete_original_response()
-            except Exception:
-                pass
+            await delete_original_response_if_present(interaction)
         except Exception:
             logging.exception("Failed to send support response")
             await send_private_error(
@@ -1080,6 +1085,13 @@ def mark_job_retry(job: IssueJob, exc: Exception) -> bool:
     return True
 
 
+def reschedule_job_for_cooldown(job: IssueJob, remaining: float) -> None:
+    """Delay job for live per-user cooldown without consuming retry attempts."""
+    job.next_run = time.time() + remaining
+    save_issue_jobs()
+    logging.info(f"Rescheduled {job.kind} job {job.id} for cooldown")
+
+
 async def fetch_job_context(job: IssueJob):
     guild = bot.get_guild(job.guild_id)
     if not guild:
@@ -1091,6 +1103,32 @@ async def fetch_job_context(job: IssueJob):
 
     message = await channel.fetch_message(job.message_id)
     return guild, channel, message
+
+
+async def best_effort_message_reply(
+    message: discord.Message, content: str
+) -> discord.Message | None:
+    try:
+        return await message.reply(content, mention_author=False)
+    except discord.DiscordException:
+        logging.warning("Failed to send Discord completion reply", exc_info=True)
+        return None
+
+
+async def best_effort_remove_reaction(
+    message: discord.Message, emoji: str, member: discord.abc.User
+) -> None:
+    try:
+        await message.remove_reaction(emoji, member)
+    except discord.DiscordException:
+        logging.warning("Failed to remove Discord status reaction", exc_info=True)
+
+
+async def best_effort_add_reaction(message: discord.Message, emoji: str) -> None:
+    try:
+        await message.add_reaction(emoji)
+    except discord.DiscordException:
+        logging.warning("Failed to add Discord status reaction", exc_info=True)
 
 
 async def create_issue_and_respond(
@@ -1112,22 +1150,20 @@ async def create_issue_and_respond(
         label,
     )
     _record_issue_for_rate_limit(user_id)
-    reply_msg = await target_message.reply(
+    reply_msg = await best_effort_message_reply(
+        target_message,
         f"Created {project_name} issue #{issue_number}: <{issue_url}>",
-        mention_author=False,
     )
-    try:
-        await target_message.remove_reaction("⏳", bot.user)
-    except Exception:
-        pass
-    await target_message.add_reaction("✅")
-    record_recent_issue(
-        channel.id,
-        reply_msg.id,
-        repo_name,
-        issue_number,
-        target_message.author.id,
-    )
+    await best_effort_remove_reaction(target_message, "⏳", bot.user)
+    await best_effort_add_reaction(target_message, "✅")
+    if reply_msg:
+        record_recent_issue(
+            channel.id,
+            reply_msg.id,
+            repo_name,
+            issue_number,
+            target_message.author.id,
+        )
     return issue_number, issue_url
 
 
@@ -1143,11 +1179,8 @@ async def attach_followup_and_respond(
         add_comment_to_issue, repo_name, issue_number, comment_body
     )
     _record_issue_for_rate_limit(user_id)
-    try:
-        await target_message.remove_reaction("⏳", bot.user)
-    except Exception:
-        pass
-    await target_message.add_reaction("✅")
+    await best_effort_remove_reaction(target_message, "⏳", bot.user)
+    await best_effort_add_reaction(target_message, "✅")
     logging.info(f"Attached follow-up to issue #{issue_number}")
     return comment_url
 
@@ -1168,6 +1201,10 @@ async def process_issue_job(job: IssueJob) -> bool:
     """Process one queued job. Return True when job is finished."""
     try:
         guild, channel, target_message = await fetch_job_context(job)
+        remaining = _check_rate_limit(job.user_id)
+        if remaining is not None:
+            reschedule_job_for_cooldown(job, remaining)
+            return False
         if job.kind == "create_issue":
             await create_issue_and_respond(
                 target_message=target_message,
@@ -1209,6 +1246,7 @@ async def process_due_issue_jobs() -> None:
 
 async def issue_job_worker() -> None:
     """Background worker for queued issue/comment jobs."""
+    await bot.wait_until_ready()
     while True:
         await process_due_issue_jobs()
         now = time.time()

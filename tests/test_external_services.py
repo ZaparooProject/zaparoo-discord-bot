@@ -520,6 +520,95 @@ class TestProcessReaction:
         msg.add_reaction.assert_any_call("✅")
 
     @pytest.mark.asyncio
+    async def test_queued_job_respects_live_cooldown(self, mock_channel, mock_message):
+        """Queued jobs should wait if an earlier job refreshed the cooldown."""
+        from bot import _record_issue_for_rate_limit, make_create_issue_job, process_issue_job
+
+        channel = mock_channel(channel_id=111)
+        msg = mock_message()
+        msg.id = 999
+        channel.fetch_message.return_value = msg
+        mock_guild = MagicMock()
+        job = make_create_issue_job(
+            user_id=12345,
+            guild_id=222,
+            channel_id=111,
+            message_id=999,
+            repo_name="test/repo",
+            project_name="TestProject",
+            label="bug",
+        )
+        job.attempts = 2
+        old_next_run = job.next_run
+        _record_issue_for_rate_limit(job.user_id)
+
+        with (
+            patch("bot.bot") as mock_bot,
+            patch("bot.create_issue_from_message", AsyncMock()) as create_issue,
+            patch("bot.save_issue_jobs"),
+        ):
+            mock_bot.get_guild.return_value = mock_guild
+            mock_bot.get_channel.return_value = channel
+
+            finished = await process_issue_job(job)
+
+        assert finished is False
+        assert job.attempts == 2
+        assert job.next_run > old_next_run
+        create_issue.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_issue_completion_discord_failures_do_not_abort(self, mock_channel, mock_message):
+        """Issue is still returned when Discord completion notifications fail."""
+        import discord
+
+        from bot import create_issue_and_respond
+
+        channel = mock_channel(channel_id=111)
+        msg = mock_message(author_id=777)
+        msg.reply.side_effect = discord.DiscordException("reply failed")
+        msg.remove_reaction.side_effect = discord.DiscordException("remove failed")
+        msg.add_reaction.side_effect = discord.DiscordException("add failed")
+        mock_guild = MagicMock()
+
+        with patch("bot.create_issue_from_message", AsyncMock(return_value=(5, "https://x/5"))):
+            result = await create_issue_and_respond(
+                target_message=msg,
+                channel=channel,
+                guild=mock_guild,
+                repo_name="test/repo",
+                project_name="TestProject",
+                label="bug",
+                user_id=12345,
+            )
+
+        assert result == (5, "https://x/5")
+
+    @pytest.mark.asyncio
+    async def test_followup_completion_discord_failures_do_not_abort(self, mock_message):
+        """Comment URL is still returned when Discord completion notifications fail."""
+        import discord
+
+        from bot import attach_followup_and_respond
+
+        msg = mock_message()
+        msg.remove_reaction.side_effect = discord.DiscordException("remove failed")
+        msg.add_reaction.side_effect = discord.DiscordException("add failed")
+
+        with (
+            patch("bot.build_followup_comment", AsyncMock(return_value="body")),
+            patch("bot.add_comment_to_issue", return_value="https://x/comment"),
+        ):
+            result = await attach_followup_and_respond(
+                target_message=msg,
+                repo_name="test/repo",
+                issue_number=5,
+                user_id=12345,
+            )
+
+        assert result == "https://x/comment"
+
+    @pytest.mark.asyncio
     async def test_github_rate_limited_job_requeues(self, mock_channel, mock_message):
         """GitHub rate-limit failures should keep queued job pending."""
         from github import RateLimitExceededException
