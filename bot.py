@@ -23,15 +23,16 @@ import logging
 import os
 import re
 import time
+from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import NamedTuple, TypedDict
+from typing import Literal, NamedTuple, TypedDict
 
 import aiohttp
 import discord
 from discord.ext import commands
 from dotenv import load_dotenv
-from github import Auth, Github
+from github import Auth, Github, GithubException, RateLimitExceededException
 from google import genai
 from google.genai import types
 
@@ -67,6 +68,10 @@ ISSUE_RATE_LIMIT_SECONDS = 10
 RECENT_ISSUE_TTL = 86400  # 24 hours
 MAX_RECENT_PER_CHANNEL = 50
 RECENT_ISSUES_FILE = STATE_DIR / "recent_issues.json"
+ISSUE_JOBS_FILE = STATE_DIR / "issue_jobs.json"
+ISSUE_JOB_RETRY_BASE_SECONDS = 30
+ISSUE_JOB_MAX_ATTEMPTS = 5
+ISSUE_JOB_TTL = 86400  # 24 hours
 
 PROJECTS = {
     "🖥️": ("ZaparooProject/zaparoo-core", "Core"),
@@ -81,6 +86,7 @@ ISSUE_TYPES = {
     "💡": "enhancement",
     "📋": None,
 }
+
 
 class SupportButton(TypedDict, total=False):
     label: str
@@ -145,8 +151,28 @@ class RecentIssue(NamedTuple):
     timestamp: float
 
 
+@dataclass
+class IssueJob:
+    kind: Literal["create_issue", "followup_comment"]
+    user_id: int
+    guild_id: int
+    channel_id: int
+    message_id: int
+    repo_name: str
+    project_name: str = ""
+    label: str | None = None
+    issue_number: int | None = None
+    attempts: int = 0
+    next_run: float = 0
+    created_at: float = 0
+    id: str = ""
+
+
 # Track recently created issues for follow-up attachment (channel_id -> entries)
 recent_issues: dict[int, list[RecentIssue]] = {}
+
+# Queued issue/comment jobs waiting on local or GitHub rate limits
+issue_jobs: list[IssueJob] = []
 
 # Per-user issue creation timestamps for rate limiting
 _user_issue_timestamps: dict[int, float] = {}
@@ -157,6 +183,42 @@ intents.reactions = True
 intents.guilds = True
 intents.messages = True
 intents.members = True
+
+
+async def send_private_message(
+    interaction: discord.Interaction, content: str, *, followup: bool = False
+) -> None:
+    """Send interaction-scoped private feedback."""
+    if followup:
+        await interaction.followup.send(content, ephemeral=True)
+        return
+
+    is_done = False
+    is_done_func = getattr(interaction.response, "is_done", None)
+    if callable(is_done_func):
+        try:
+            response_done = is_done_func()
+            is_done = response_done if isinstance(response_done, bool) else False
+        except Exception:
+            is_done = False
+
+    if is_done:
+        await interaction.followup.send(content, ephemeral=True)
+    else:
+        await interaction.response.send_message(content, ephemeral=True)
+
+
+async def send_private_error(
+    interaction: discord.Interaction,
+    content: str = "Failed to create issue. Check bot logs for details.",
+    *,
+    followup: bool = False,
+) -> None:
+    """Send generic private error feedback, swallowing Discord send failures."""
+    try:
+        await send_private_message(interaction, content, followup=followup)
+    except Exception:
+        logging.exception("Failed to send private error")
 
 
 def make_support_callback(response_config: dict):
@@ -189,11 +251,20 @@ def make_support_callback(response_config: dict):
                 )
             )
 
-        await interaction.response.send_message("Sent!", ephemeral=True)
+        await interaction.response.defer(ephemeral=True, thinking=True)
         try:
             await message.reply(embed=embed, view=view, mention_author=False)
+            try:
+                await interaction.delete_original_response()
+            except Exception:
+                pass
         except Exception:
             logging.exception("Failed to send support response")
+            await send_private_error(
+                interaction,
+                "Failed to send support response. Check bot logs for details.",
+                followup=True,
+            )
 
     return callback
 
@@ -227,16 +298,6 @@ class CreateIssueModal(discord.ui.Modal, title="Create Issue"):
         self.target_message = target_message
 
     async def on_submit(self, interaction: discord.Interaction):
-        remaining = _check_rate_limit(interaction.user.id)
-        if remaining is not None:
-            await interaction.response.send_message(
-                f"Rate-limited. Try again in {remaining:.0f}s.",
-                ephemeral=True,
-            )
-            return
-
-        await interaction.response.defer(ephemeral=True, thinking=True)
-
         repo_name = self.project.values[0]
         project_name = next(n for _, (r, n) in PROJECTS.items() if r == repo_name)
         label = self.issue_type.values[0]
@@ -245,43 +306,73 @@ class CreateIssueModal(discord.ui.Modal, title="Create Issue"):
 
         channel = self.target_message.channel
         guild = self.target_message.guild
+        remaining = _check_rate_limit(interaction.user.id)
+        if remaining is not None:
+            enqueue_issue_job(
+                make_create_issue_job(
+                    user_id=interaction.user.id,
+                    guild_id=guild.id,
+                    channel_id=channel.id,
+                    message_id=self.target_message.id,
+                    repo_name=repo_name,
+                    project_name=project_name,
+                    label=label,
+                    delay=remaining,
+                )
+            )
+            try:
+                await self.target_message.add_reaction("⏳")
+            except Exception:
+                pass
+            await send_private_message(
+                interaction,
+                "Queued. I'll create the issue when the cooldown clears.",
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
 
         try:
-            issue_number, issue_url = await create_issue_from_message(
-                self.target_message,
-                channel,
-                guild,
-                repo_name,
-                project_name,
-                label,
+            issue_number, issue_url = await create_issue_and_respond(
+                target_message=self.target_message,
+                channel=channel,
+                guild=guild,
+                repo_name=repo_name,
+                project_name=project_name,
+                label=label,
+                user_id=interaction.user.id,
             )
-            _record_issue_for_rate_limit(interaction.user.id)
             await interaction.followup.send(
                 f"Created {project_name} issue #{issue_number}: <{issue_url}>",
                 ephemeral=True,
             )
-            reply_msg = await self.target_message.reply(
-                f"Created {project_name} issue #{issue_number}: <{issue_url}>",
-                mention_author=False,
-            )
-            await self.target_message.add_reaction("✅")
-
-            record_recent_issue(
-                channel.id,
-                reply_msg.id,
-                repo_name,
-                issue_number,
-                self.target_message.author.id,
-            )
-        except Exception:
-            logging.exception("Failed to create issue via context menu")
-            try:
-                await interaction.followup.send(
-                    "Failed to create issue. Check bot logs for details.",
-                    ephemeral=True,
+        except Exception as exc:
+            if is_github_rate_limit(exc):
+                enqueue_issue_job(
+                    make_create_issue_job(
+                        user_id=interaction.user.id,
+                        guild_id=guild.id,
+                        channel_id=channel.id,
+                        message_id=self.target_message.id,
+                        repo_name=repo_name,
+                        project_name=project_name,
+                        label=label,
+                        delay=retry_delay_for_exception(exc, 1),
+                        attempts=1,
+                    )
                 )
-            except Exception:
-                pass
+                try:
+                    await self.target_message.add_reaction("⏳")
+                except Exception:
+                    pass
+                await send_private_message(
+                    interaction,
+                    "Queued. I'll create the issue when GitHub accepts it.",
+                    followup=True,
+                )
+                return
+            logging.exception("Failed to create issue via context menu")
+            await send_private_error(interaction, followup=True)
 
 
 async def create_issue_callback(interaction: discord.Interaction, message: discord.Message):
@@ -302,9 +393,12 @@ class IssueBot(commands.Bot):
         super().__init__(command_prefix="!", intents=intents, help_command=None)
         self.http_session: aiohttp.ClientSession | None = None
         self._tree_synced: bool = False
+        self._issue_job_worker_task: asyncio.Task | None = None
 
     async def setup_hook(self):
         self.http_session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30))
+        load_issue_jobs()
+        self._issue_job_worker_task = asyncio.create_task(issue_job_worker())
         for response_config in SUPPORT_RESPONSES:
             name = response_config.get("name", "Support")
             callback = make_support_callback(response_config)
@@ -315,6 +409,12 @@ class IssueBot(commands.Bot):
         self.tree.add_command(cmd)
 
     async def close(self):
+        if self._issue_job_worker_task:
+            self._issue_job_worker_task.cancel()
+            try:
+                await self._issue_job_worker_task
+            except asyncio.CancelledError:
+                pass
         if self.http_session:
             await self.http_session.close()
         await super().close()
@@ -345,8 +445,91 @@ def init():
     load_recent_issues()
 
 
+FALLBACK_ISSUE_TITLE = "Issue from Discord"
+MAX_ISSUE_TITLE_LENGTH = 100
+_AUTHOR_LINE_RE = re.compile(r"^\*\*.+\*\* - \d{4}-\d{2}-\d{2} \d{2}:\d{2} UTC$")
+_ATTACHMENT_LINK_RE = re.compile(r"!?\[([^\]]+)\]\([^)]+\)")
+_ATTACHMENT_NOTE_RE = re.compile(r"\*\[attachment (?:omitted|failed to download): ([^\]]+)\]\*")
+_MARKDOWN_ESCAPE_RE = re.compile(r"\\([\\`*_\[\]()])")
+
+
+def _normalize_issue_title(text: str, max_length: int = MAX_ISSUE_TITLE_LENGTH) -> str:
+    """Clean and truncate generated or fallback issue titles."""
+    title = _MARKDOWN_ESCAPE_RE.sub(r"\1", text)
+    title = re.sub(r"\s+", " ", title).strip().strip("\"'")
+    if not title:
+        return ""
+    if len(title) <= max_length:
+        return title
+
+    suffix = "…"
+    cut = max_length - len(suffix)
+    truncated = title[: cut + 1].rsplit(" ", 1)[0].rstrip(".,;:- ")
+    if not truncated:
+        truncated = title[:cut].rstrip(".,;:- ")
+    return f"{truncated}{suffix}"
+
+
+def _section_lines(body: str, heading: str) -> list[str]:
+    """Return lines below a markdown heading until next heading."""
+    lines = body.splitlines()
+    try:
+        start = lines.index(heading) + 1
+    except ValueError:
+        return []
+
+    section = []
+    for line in lines[start:]:
+        if line.startswith("### ") or line == "---":
+            break
+        section.append(line)
+    return section
+
+
+def _extract_reported_message_title(body: str) -> str:
+    """Build a fallback title from Reported Message text."""
+    message_lines = []
+    for line in _section_lines(body, "### Reported Message"):
+        if not line.startswith(">"):
+            continue
+        text = line[1:].strip()
+        if not text or text == "*[no text content]*" or _AUTHOR_LINE_RE.match(text):
+            continue
+        message_lines.append(text)
+    return _normalize_issue_title(" ".join(message_lines))
+
+
+def _extract_attachment_names(body: str) -> list[str]:
+    """Find attachment filenames from issue body markdown."""
+    names = []
+    for line in _section_lines(body, "### Attachments"):
+        names.extend(match.group(1) for match in _ATTACHMENT_LINK_RE.finditer(line))
+    for line in body.splitlines():
+        match = _ATTACHMENT_NOTE_RE.search(line)
+        if match:
+            names.append(match.group(1))
+    return names
+
+
+def fallback_issue_title(body: str) -> str:
+    """Generate a deterministic issue title when Gemini is unavailable."""
+    reported_title = _extract_reported_message_title(body)
+    if reported_title:
+        return reported_title
+
+    attachment_names = _extract_attachment_names(body)
+    if attachment_names:
+        return _normalize_issue_title(f"Attachment report: {', '.join(attachment_names[:3])}")
+
+    return FALLBACK_ISSUE_TITLE
+
+
 async def generate_issue_title(body: str) -> str:
     """Generate a concise issue title using Gemini."""
+    if not gemini_client:
+        logging.warning("Gemini client unavailable, using fallback issue title")
+        return fallback_issue_title(body)
+
     truncated_body = body[:4000] if len(body) > 4000 else body
     try:
         response = await gemini_client.aio.models.generate_content(
@@ -367,10 +550,11 @@ async def generate_issue_title(body: str) -> str:
                 thinking_config=types.ThinkingConfig(thinking_budget=0),
             ),
         )
-        return response.text.strip() if response.text else "Issue from Discord"
+        title = _normalize_issue_title(response.text or "")
+        return title or fallback_issue_title(body)
     except Exception:
-        logging.exception("Failed to generate title")
-        return "Issue from Discord"
+        logging.exception("Failed to generate title, using fallback issue title")
+        return fallback_issue_title(body)
 
 
 async def walk_reply_chain(
@@ -728,6 +912,311 @@ def record_recent_issue(
     save_recent_issues()
 
 
+def _new_issue_job_id(job: IssueJob) -> str:
+    parts = [
+        job.kind,
+        str(job.user_id),
+        str(job.guild_id),
+        str(job.channel_id),
+        str(job.message_id),
+        job.repo_name,
+        str(job.issue_number or ""),
+        str(int(time.time() * 1000)),
+    ]
+    return hashlib.sha256(":".join(parts).encode()).hexdigest()[:16]
+
+
+def _issue_job_key(job: IssueJob) -> tuple:
+    return (
+        job.kind,
+        job.user_id,
+        job.guild_id,
+        job.channel_id,
+        job.message_id,
+        job.repo_name,
+        job.project_name,
+        job.label,
+        job.issue_number,
+    )
+
+
+def save_issue_jobs() -> None:
+    """Atomically write queued issue jobs to disk."""
+    try:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = ISSUE_JOBS_FILE.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps([asdict(job) for job in issue_jobs]))
+        tmp.replace(ISSUE_JOBS_FILE)
+    except Exception:
+        logging.exception("Failed to save issue_jobs")
+
+
+def load_issue_jobs() -> None:
+    """Load queued issue jobs from disk, skipping stale or invalid entries."""
+    if not ISSUE_JOBS_FILE.exists():
+        return
+    try:
+        now = time.time()
+        raw = json.loads(ISSUE_JOBS_FILE.read_text())
+        issue_jobs.clear()
+        for item in raw:
+            job = IssueJob(**item)
+            if now - job.created_at <= ISSUE_JOB_TTL:
+                issue_jobs.append(job)
+        logging.info(f"Loaded {len(issue_jobs)} queued issue job(s)")
+    except Exception:
+        logging.exception("Failed to load issue_jobs, starting fresh")
+        issue_jobs.clear()
+
+
+def enqueue_issue_job(job: IssueJob) -> IssueJob:
+    """Queue issue work, deduplicating repeated quick reactions."""
+    now = time.time()
+    if not job.created_at:
+        job.created_at = now
+    if not job.next_run:
+        job.next_run = now
+    if not job.id:
+        job.id = _new_issue_job_id(job)
+
+    job_key = _issue_job_key(job)
+    for existing in issue_jobs:
+        if _issue_job_key(existing) == job_key:
+            existing.next_run = max(existing.next_run, job.next_run)
+            save_issue_jobs()
+            return existing
+
+    issue_jobs.append(job)
+    save_issue_jobs()
+    logging.info(f"Queued {job.kind} job {job.id}")
+    return job
+
+
+def make_create_issue_job(
+    *,
+    user_id: int,
+    guild_id: int,
+    channel_id: int,
+    message_id: int,
+    repo_name: str,
+    project_name: str,
+    label: str | None,
+    delay: float = 0,
+    attempts: int = 0,
+) -> IssueJob:
+    now = time.time()
+    return IssueJob(
+        kind="create_issue",
+        user_id=user_id,
+        guild_id=guild_id,
+        channel_id=channel_id,
+        message_id=message_id,
+        repo_name=repo_name,
+        project_name=project_name,
+        label=label,
+        attempts=attempts,
+        next_run=now + delay,
+        created_at=now,
+    )
+
+
+def make_followup_job(
+    *,
+    user_id: int,
+    guild_id: int,
+    channel_id: int,
+    message_id: int,
+    repo_name: str,
+    issue_number: int,
+    delay: float = 0,
+    attempts: int = 0,
+) -> IssueJob:
+    now = time.time()
+    return IssueJob(
+        kind="followup_comment",
+        user_id=user_id,
+        guild_id=guild_id,
+        channel_id=channel_id,
+        message_id=message_id,
+        repo_name=repo_name,
+        issue_number=issue_number,
+        attempts=attempts,
+        next_run=now + delay,
+        created_at=now,
+    )
+
+
+def retry_delay_for_exception(exc: Exception, attempts: int) -> float:
+    """Return retry delay for GitHub rate limits, preferring reset headers."""
+    headers = getattr(exc, "headers", None) or {}
+    reset_at = headers.get("x-ratelimit-reset") or headers.get("X-RateLimit-Reset")
+    if reset_at:
+        try:
+            return max(float(reset_at) - time.time(), ISSUE_JOB_RETRY_BASE_SECONDS)
+        except (TypeError, ValueError):
+            pass
+    return min(ISSUE_JOB_RETRY_BASE_SECONDS * (2 ** max(attempts - 1, 0)), 900)
+
+
+def is_github_rate_limit(exc: Exception) -> bool:
+    """Detect retryable GitHub rate-limit failures from PyGithub."""
+    if isinstance(exc, RateLimitExceededException):
+        return True
+    if isinstance(exc, GithubException):
+        status = getattr(exc, "status", None)
+        message = str(exc).lower()
+        return status in {403, 429} and "rate limit" in message
+    return False
+
+
+def mark_job_retry(job: IssueJob, exc: Exception) -> bool:
+    """Schedule retry. Return False when job exhausted retries."""
+    job.attempts += 1
+    if job.attempts >= ISSUE_JOB_MAX_ATTEMPTS or time.time() - job.created_at > ISSUE_JOB_TTL:
+        return False
+    job.next_run = time.time() + retry_delay_for_exception(exc, job.attempts)
+    save_issue_jobs()
+    logging.warning(f"Retrying {job.kind} job {job.id} after rate limit")
+    return True
+
+
+async def fetch_job_context(job: IssueJob):
+    guild = bot.get_guild(job.guild_id)
+    if not guild:
+        raise RuntimeError("Queued job guild not found")
+
+    channel = bot.get_channel(job.channel_id)
+    if not channel:
+        channel = await bot.fetch_channel(job.channel_id)
+
+    message = await channel.fetch_message(job.message_id)
+    return guild, channel, message
+
+
+async def create_issue_and_respond(
+    *,
+    target_message: discord.Message,
+    channel: discord.abc.Messageable,
+    guild: discord.Guild,
+    repo_name: str,
+    project_name: str,
+    label: str | None,
+    user_id: int,
+) -> tuple[int, str]:
+    issue_number, issue_url = await create_issue_from_message(
+        target_message,
+        channel,
+        guild,
+        repo_name,
+        project_name,
+        label,
+    )
+    _record_issue_for_rate_limit(user_id)
+    reply_msg = await target_message.reply(
+        f"Created {project_name} issue #{issue_number}: <{issue_url}>",
+        mention_author=False,
+    )
+    try:
+        await target_message.remove_reaction("⏳", bot.user)
+    except Exception:
+        pass
+    await target_message.add_reaction("✅")
+    record_recent_issue(
+        channel.id,
+        reply_msg.id,
+        repo_name,
+        issue_number,
+        target_message.author.id,
+    )
+    return issue_number, issue_url
+
+
+async def attach_followup_and_respond(
+    *,
+    target_message: discord.Message,
+    repo_name: str,
+    issue_number: int,
+    user_id: int,
+) -> str:
+    comment_body = await build_followup_comment(target_message)
+    comment_url = await asyncio.to_thread(
+        add_comment_to_issue, repo_name, issue_number, comment_body
+    )
+    _record_issue_for_rate_limit(user_id)
+    try:
+        await target_message.remove_reaction("⏳", bot.user)
+    except Exception:
+        pass
+    await target_message.add_reaction("✅")
+    logging.info(f"Attached follow-up to issue #{issue_number}")
+    return comment_url
+
+
+async def fail_job_reaction(job: IssueJob) -> None:
+    try:
+        _, _, message = await fetch_job_context(job)
+        try:
+            await message.remove_reaction("⏳", bot.user)
+        except Exception:
+            pass
+        await message.add_reaction("❌")
+    except Exception:
+        logging.exception(f"Failed to mark queued job {job.id} as failed")
+
+
+async def process_issue_job(job: IssueJob) -> bool:
+    """Process one queued job. Return True when job is finished."""
+    try:
+        guild, channel, target_message = await fetch_job_context(job)
+        if job.kind == "create_issue":
+            await create_issue_and_respond(
+                target_message=target_message,
+                channel=channel,
+                guild=guild,
+                repo_name=job.repo_name,
+                project_name=job.project_name,
+                label=job.label,
+                user_id=job.user_id,
+            )
+        else:
+            if job.issue_number is None:
+                raise RuntimeError("Queued follow-up job missing issue number")
+            await attach_followup_and_respond(
+                target_message=target_message,
+                repo_name=job.repo_name,
+                issue_number=job.issue_number,
+                user_id=job.user_id,
+            )
+        return True
+    except Exception as exc:
+        if is_github_rate_limit(exc) and mark_job_retry(job, exc):
+            return False
+        logging.exception(f"Queued {job.kind} job {job.id} failed")
+        await fail_job_reaction(job)
+        return True
+
+
+async def process_due_issue_jobs() -> None:
+    now = time.time()
+    for job in list(issue_jobs):
+        if job.next_run > now:
+            continue
+        finished = await process_issue_job(job)
+        if finished and job in issue_jobs:
+            issue_jobs.remove(job)
+            save_issue_jobs()
+
+
+async def issue_job_worker() -> None:
+    """Background worker for queued issue/comment jobs."""
+    while True:
+        await process_due_issue_jobs()
+        now = time.time()
+        due_times = [job.next_run for job in issue_jobs]
+        sleep_for = min(max(min(due_times) - now, 1), 30) if due_times else 5
+        await asyncio.sleep(sleep_for)
+
+
 async def create_issue_from_message(
     target_message: discord.Message,
     channel: discord.abc.Messageable,
@@ -877,6 +1366,11 @@ def cleanup_pending():
     for uid in stale_users:
         del _user_issue_timestamps[uid]
 
+    before_jobs = len(issue_jobs)
+    issue_jobs[:] = [job for job in issue_jobs if now - job.created_at <= ISSUE_JOB_TTL]
+    if len(issue_jobs) != before_jobs:
+        save_issue_jobs()
+
 
 def _check_rate_limit(user_id: int) -> float | None:
     """Return seconds remaining in cooldown if rate-limited, else None."""
@@ -964,11 +1458,22 @@ async def process_reaction(payload: discord.RawReactionActionEvent):
         remaining = _check_rate_limit(payload.user_id)
         if remaining is not None:
             try:
-                await target_message.reply(
-                    f"Rate-limited. Try again in {remaining:.0f}s.",
-                    mention_author=False,
-                    delete_after=10,
+                await target_message.remove_reaction("📎", payload.member)
+            except Exception:
+                pass
+            enqueue_issue_job(
+                make_followup_job(
+                    user_id=payload.user_id,
+                    guild_id=payload.guild_id,
+                    channel_id=payload.channel_id,
+                    message_id=message_id,
+                    repo_name=match.repo_name,
+                    issue_number=match.issue_number,
+                    delay=remaining,
                 )
+            )
+            try:
+                await target_message.add_reaction("⏳")
             except Exception:
                 pass
             return
@@ -979,15 +1484,27 @@ async def process_reaction(payload: discord.RawReactionActionEvent):
         except Exception:
             pass
         try:
-            comment_body = await build_followup_comment(target_message)
-            await asyncio.to_thread(
-                add_comment_to_issue, match.repo_name, match.issue_number, comment_body
+            await attach_followup_and_respond(
+                target_message=target_message,
+                repo_name=match.repo_name,
+                issue_number=match.issue_number,
+                user_id=payload.user_id,
             )
-            _record_issue_for_rate_limit(payload.user_id)
-            await target_message.remove_reaction("⏳", bot.user)
-            await target_message.add_reaction("✅")
-            logging.info(f"Attached follow-up to issue #{match.issue_number}")
-        except Exception:
+        except Exception as exc:
+            if is_github_rate_limit(exc):
+                enqueue_issue_job(
+                    make_followup_job(
+                        user_id=payload.user_id,
+                        guild_id=payload.guild_id,
+                        channel_id=payload.channel_id,
+                        message_id=message_id,
+                        repo_name=match.repo_name,
+                        issue_number=match.issue_number,
+                        delay=retry_delay_for_exception(exc, 1),
+                        attempts=1,
+                    )
+                )
+                return
             logging.exception("Failed to attach follow-up")
             try:
                 await target_message.remove_reaction("⏳", bot.user)
@@ -1025,12 +1542,20 @@ async def process_reaction(payload: discord.RawReactionActionEvent):
     # Rate limit check
     remaining = _check_rate_limit(payload.user_id)
     if remaining is not None:
-        try:
-            await target_message.reply(
-                f"Rate-limited. Try again in {remaining:.0f}s.",
-                mention_author=False,
-                delete_after=10,
+        enqueue_issue_job(
+            make_create_issue_job(
+                user_id=payload.user_id,
+                guild_id=payload.guild_id,
+                channel_id=payload.channel_id,
+                message_id=message_id,
+                repo_name=repo_name,
+                project_name=project_name,
+                label=label,
+                delay=remaining,
             )
+        )
+        try:
+            await target_message.add_reaction("⏳")
         except Exception:
             pass
         return
@@ -1042,49 +1567,38 @@ async def process_reaction(payload: discord.RawReactionActionEvent):
 
     # Create issue using shared logic
     try:
-        issue_number, issue_url = await create_issue_from_message(
-            target_message,
-            channel,
-            guild,
-            repo_name,
-            project_name,
-            label,
+        await create_issue_and_respond(
+            target_message=target_message,
+            channel=channel,
+            guild=guild,
+            repo_name=repo_name,
+            project_name=project_name,
+            label=label,
+            user_id=payload.user_id,
         )
 
-        _record_issue_for_rate_limit(payload.user_id)
-        reply_msg = await target_message.reply(
-            f"Created {project_name} issue #{issue_number}: <{issue_url}>",
-            mention_author=False,
-        )
-        try:
-            await target_message.remove_reaction("⏳", bot.user)
-        except Exception:
-            pass
-        await target_message.add_reaction("✅")
-
-        record_recent_issue(
-            channel.id,
-            reply_msg.id,
-            repo_name,
-            issue_number,
-            target_message.author.id,
-        )
-
-    except Exception:
+    except Exception as exc:
+        if is_github_rate_limit(exc):
+            enqueue_issue_job(
+                make_create_issue_job(
+                    user_id=payload.user_id,
+                    guild_id=payload.guild_id,
+                    channel_id=payload.channel_id,
+                    message_id=message_id,
+                    repo_name=repo_name,
+                    project_name=project_name,
+                    label=label,
+                    delay=retry_delay_for_exception(exc, 1),
+                    attempts=1,
+                )
+            )
+            return
         logging.exception("Failed to create issue")
         try:
             await target_message.remove_reaction("⏳", bot.user)
         except Exception:
             pass
         await target_message.add_reaction("❌")
-
-        try:
-            await target_message.reply(
-                "Failed to create issue. Check bot logs for details.",
-                mention_author=False,
-            )
-        except Exception:
-            pass
 
 
 @bot.event
@@ -1161,10 +1675,31 @@ async def on_message(message: discord.Message):
     if not any(repo == repo_name for _, (repo, _) in PROJECTS.items()):
         return
 
+    remaining = _check_rate_limit(message.author.id)
+    if remaining is not None:
+        enqueue_issue_job(
+            make_followup_job(
+                user_id=message.author.id,
+                guild_id=message.guild.id,
+                channel_id=message.channel.id,
+                message_id=message.id,
+                repo_name=repo_name,
+                issue_number=issue_number,
+                delay=remaining,
+            )
+        )
+        try:
+            await message.add_reaction("⏳")
+        except Exception:
+            pass
+        return
+
     try:
-        comment_body = await build_followup_comment(message)
-        comment_url = await asyncio.to_thread(
-            add_comment_to_issue, repo_name, issue_number, comment_body
+        comment_url = await attach_followup_and_respond(
+            target_message=message,
+            repo_name=repo_name,
+            issue_number=issue_number,
+            user_id=message.author.id,
         )
         await message.add_reaction("📎")
         await message.reply(
@@ -1172,7 +1707,21 @@ async def on_message(message: discord.Message):
             mention_author=False,
         )
         logging.info(f"Attached reply follow-up to issue #{issue_number}")
-    except Exception:
+    except Exception as exc:
+        if is_github_rate_limit(exc):
+            enqueue_issue_job(
+                make_followup_job(
+                    user_id=message.author.id,
+                    guild_id=message.guild.id,
+                    channel_id=message.channel.id,
+                    message_id=message.id,
+                    repo_name=repo_name,
+                    issue_number=issue_number,
+                    delay=retry_delay_for_exception(exc, 1),
+                    attempts=1,
+                )
+            )
+            return
         logging.exception("Failed to attach reply follow-up")
 
 

@@ -555,8 +555,8 @@ class TestErrorHandling:
     """Tests for error handling scenarios."""
 
     @pytest.mark.asyncio
-    async def test_github_error_shows_failure(self, bot_instance, mock_gemini, error_log_detector):
-        """GitHub API errors should show failure reaction."""
+    async def test_github_error_stays_private(self, bot_instance, mock_gemini, error_log_detector):
+        """GitHub API errors should not post public failure text."""
 
         guild = dpytest.get_config().guilds[0]
         role = await guild.create_role(name="IssueCreator")
@@ -566,7 +566,7 @@ class TestErrorHandling:
         # Mock GitHub to raise an error
         mock_repo = MagicMock()
         mock_repo.get_labels.return_value = []
-        mock_repo.create_issue.side_effect = Exception("API rate limit exceeded")
+        mock_repo.create_issue.side_effect = Exception("API unavailable")
 
         mock_client = MagicMock()
         mock_client.get_repo.return_value = mock_repo
@@ -580,13 +580,8 @@ class TestErrorHandling:
             msg = await dpytest.message("This will fail")
             await dpytest.add_reaction(member, msg, "🐛")
 
-            # Should get an error message
-            assert (
-                dpytest.verify()
-                .message()
-                .contains()
-                .content("Failed to create issue. Check bot logs for details.")
-            )
+            # Should not leak error text into the channel
+            assert dpytest.verify().message().nothing()
 
             # This test expects an error log - verify it was logged
             error_log_detector.assert_no_errors(allowed_messages=["Failed to create issue"])

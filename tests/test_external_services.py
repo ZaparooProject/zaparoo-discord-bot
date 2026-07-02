@@ -43,8 +43,58 @@ class TestGenerateIssueTitle:
             assert len(call_args.kwargs["contents"]) == 4000
 
     @pytest.mark.asyncio
-    async def test_api_failure_returns_fallback(self):
-        """API failure should return fallback title."""
+    async def test_api_failure_uses_reported_message_fallback(self):
+        """API failure should derive fallback title from reported message."""
+        from bot import generate_issue_title
+
+        mock_client = MagicMock()
+        mock_client.aio.models.generate_content = AsyncMock(side_effect=Exception("API Error"))
+        body = "\n".join(
+            [
+                "### Reported Message",
+                "",
+                "**>>> Target Message:**",
+                "> **Reporter** - 2026-06-10 15:30 UTC",
+                "> ",
+                "> App crashes when opening Settings on Android",
+            ]
+        )
+
+        with patch("bot.gemini_client", mock_client):
+            title = await generate_issue_title(body)
+
+            assert title == "App crashes when opening Settings on Android"
+
+    @pytest.mark.asyncio
+    async def test_empty_title_uses_attachment_fallback(self):
+        """Empty API response should derive fallback title from attachment filename."""
+        from bot import generate_issue_title
+
+        mock_client = MagicMock()
+        mock_client.aio.models.generate_content = AsyncMock(return_value=MagicMock(text=""))
+        body = "\n".join(
+            [
+                "### Reported Message",
+                "",
+                "**>>> Target Message:**",
+                "> **Reporter** - 2026-06-10 15:30 UTC",
+                "> ",
+                "> *[no text content]*",
+                "",
+                "### Attachments",
+                "",
+                "[zaparoo-core-2024-01-15.log](https://example.com/log)",
+            ]
+        )
+
+        with patch("bot.gemini_client", mock_client):
+            title = await generate_issue_title(body)
+
+            assert title == "Attachment report: zaparoo-core-2024-01-15.log"
+
+    @pytest.mark.asyncio
+    async def test_api_failure_returns_generic_fallback_without_reported_message(self):
+        """API failure should still return generic fallback for unparseable body."""
         from bot import generate_issue_title
 
         mock_client = MagicMock()
@@ -394,6 +444,152 @@ class TestProcessReaction:
 
         pending_projects.clear()
 
+    @pytest.mark.asyncio
+    async def test_rate_limited_reaction_queues_without_public_reply(
+        self, mock_reaction_payload, mock_channel, mock_message
+    ):
+        """Cooldown should queue issue creation without a public error reply."""
+        from bot import _record_issue_for_rate_limit, issue_jobs, process_reaction
+
+        with (
+            patch("bot.AUTHORIZED_ROLE_ID", 99999),
+            patch("bot.ISSUE_TYPES", {"🐛": "bug"}),
+            patch("bot.DEFAULT_PROJECT", ("test/repo", "TestProject")),
+            patch("bot.save_issue_jobs"),
+        ):
+            payload = mock_reaction_payload(emoji="🐛", member_roles=[99999], user_id=12345)
+            _record_issue_for_rate_limit(payload.user_id)
+
+            channel = mock_channel()
+            msg = mock_message()
+            channel.fetch_message.return_value = msg
+            mock_guild = MagicMock()
+
+            with patch("bot.bot") as mock_bot:
+                mock_bot.get_guild.return_value = mock_guild
+                mock_bot.get_channel.return_value = channel
+                mock_bot.user = MagicMock()
+
+                await process_reaction(payload)
+
+            assert len(issue_jobs) == 1
+            assert issue_jobs[0].kind == "create_issue"
+            msg.reply.assert_not_called()
+            msg.add_reaction.assert_any_call("⏳")
+
+    @pytest.mark.asyncio
+    async def test_queued_job_creates_issue_and_marks_success(self, mock_channel, mock_message):
+        """Queued create job should create issue and add success reaction."""
+        from bot import make_create_issue_job, process_issue_job
+
+        channel = mock_channel(channel_id=111)
+        msg = mock_message(author_id=777)
+        msg.id = 999
+        reply_msg = MagicMock()
+        reply_msg.id = 555
+        msg.reply.return_value = reply_msg
+        channel.fetch_message.return_value = msg
+        mock_guild = MagicMock()
+        mock_guild.id = 222
+        mock_guild.name = "Test Server"
+
+        job = make_create_issue_job(
+            user_id=12345,
+            guild_id=222,
+            channel_id=111,
+            message_id=999,
+            repo_name="test/repo",
+            project_name="TestProject",
+            label="bug",
+        )
+
+        with (
+            patch("bot.bot") as mock_bot,
+            patch("bot.create_issue_from_message", AsyncMock(return_value=(5, "https://x/5"))),
+            patch("bot.save_recent_issues"),
+        ):
+            mock_bot.get_guild.return_value = mock_guild
+            mock_bot.get_channel.return_value = channel
+            mock_bot.user = MagicMock()
+
+            finished = await process_issue_job(job)
+
+        assert finished is True
+        msg.reply.assert_called_once()
+        assert "issue #5" in msg.reply.call_args[0][0]
+        msg.add_reaction.assert_any_call("✅")
+
+    @pytest.mark.asyncio
+    async def test_github_rate_limited_job_requeues(self, mock_channel, mock_message):
+        """GitHub rate-limit failures should keep queued job pending."""
+        from github import RateLimitExceededException
+
+        from bot import make_create_issue_job, process_issue_job
+
+        channel = mock_channel(channel_id=111)
+        msg = mock_message()
+        msg.id = 999
+        channel.fetch_message.return_value = msg
+        mock_guild = MagicMock()
+        job = make_create_issue_job(
+            user_id=12345,
+            guild_id=222,
+            channel_id=111,
+            message_id=999,
+            repo_name="test/repo",
+            project_name="TestProject",
+            label="bug",
+        )
+
+        with (
+            patch("bot.bot") as mock_bot,
+            patch(
+                "bot.create_issue_from_message",
+                AsyncMock(side_effect=RateLimitExceededException(403, {"message": "rate limit"})),
+            ),
+            patch("bot.save_issue_jobs"),
+        ):
+            mock_bot.get_guild.return_value = mock_guild
+            mock_bot.get_channel.return_value = channel
+            mock_bot.user = MagicMock()
+
+            finished = await process_issue_job(job)
+
+        assert finished is False
+        assert job.attempts == 1
+        assert job.next_run > job.created_at
+        msg.reply.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_reaction_failure_adds_error_reaction_without_public_reply(
+        self, mock_reaction_payload, mock_channel, mock_message
+    ):
+        """Non-retryable reaction failures should not post public error text."""
+        from bot import process_reaction
+
+        with (
+            patch("bot.AUTHORIZED_ROLE_ID", 99999),
+            patch("bot.ISSUE_TYPES", {"🐛": "bug"}),
+            patch("bot.DEFAULT_PROJECT", ("test/repo", "TestProject")),
+            patch("bot.create_issue_from_message", AsyncMock(side_effect=Exception("boom"))),
+        ):
+            payload = mock_reaction_payload(emoji="🐛", member_roles=[99999])
+            channel = mock_channel()
+            msg = mock_message()
+            channel.fetch_message.return_value = msg
+            mock_guild = MagicMock()
+
+            with patch("bot.bot") as mock_bot:
+                mock_bot.get_guild.return_value = mock_guild
+                mock_bot.get_channel.return_value = channel
+                mock_bot.user = MagicMock()
+                mock_bot.http_session = MagicMock()
+
+                await process_reaction(payload)
+
+            msg.reply.assert_not_called()
+            msg.add_reaction.assert_any_call("❌")
+
 
 class TestChannelFetching:
     """Tests for channel fetching fallback."""
@@ -552,7 +748,9 @@ class TestSupportResponses:
         assert view.children[0].url == "https://example.com/logs"
         assert view.children[1].label == "Support"
 
-        interaction.response.send_message.assert_called_once_with("Sent!", ephemeral=True)
+        interaction.response.defer.assert_called_once_with(ephemeral=True, thinking=True)
+        interaction.delete_original_response.assert_called_once()
+        interaction.followup.send.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_unauthorized_user_rejected(self, mock_role):
